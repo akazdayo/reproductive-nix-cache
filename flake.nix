@@ -61,6 +61,7 @@
               cargo-edit
               cargo-watch
               rust-analyzer
+              nix-output-monitor
               self.formatter.${system}
             ];
 
