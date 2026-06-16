@@ -1,3 +1,4 @@
+mod build_test;
 mod evidence;
 mod models;
 mod nix;

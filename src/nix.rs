@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::process::Command as ProcessCommand;
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 
 use crate::models::Derivation;
 
@@ -34,9 +34,7 @@ pub fn run_build(package_ref: &str, full_rebuild: bool) -> anyhow::Result<()> {
         .args(&args)
         .status()
         .or_else(|_| ProcessCommand::new("nix").args(&args).status())
-        .map_err(|_| {
-            anyhow!("failed to execute build command; is nix installed and on PATH?")
-        })?;
+        .map_err(|_| anyhow!("failed to execute build command; is nix installed and on PATH?"))?;
 
     if !status.success() {
         return Err(anyhow!(
@@ -52,8 +50,8 @@ pub fn run_build(package_ref: &str, full_rebuild: bool) -> anyhow::Result<()> {
 /// Expects a JSON object like `{ "/nix/store/...": { "narHash": "..." } }`
 /// and returns the store path and narHash.
 pub fn extract_path_info(json: &str, label: &str) -> anyhow::Result<(String, String)> {
-    let map: HashMap<String, serde_json::Value> = serde_json::from_str(json)
-        .with_context(|| format!("failed to parse `{label}` output"))?;
+    let map: HashMap<String, serde_json::Value> =
+        serde_json::from_str(json).with_context(|| format!("failed to parse `{label}` output"))?;
     let (path, value) = map
         .into_iter()
         .next()
@@ -95,4 +93,35 @@ pub fn required_env_value(env: &HashMap<String, String>, key: &str) -> anyhow::R
     env.get(key)
         .cloned()
         .ok_or_else(|| anyhow!("derivation env did not contain `{key}`"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_nix_help() -> anyhow::Result<()> {
+        let resp = run_nix(&["--help"]);
+        if let Err(err) = resp {
+            panic!("ERROR: {:?}", err)
+        }
+        println!("{:?}", resp?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_nix_run() {
+        let resp = run_nix(&["run", "nixpkgs#hello", "--", "-t"]);
+        match resp {
+            Ok(value) => {
+                assert_eq!(value, "hello, world\n");
+            }
+            Err(err) => {
+                panic!("ERROR: {:?}", err)
+            }
+        }
+    }
+
+    #[test]
+    fn test_nix_build_cache() {}
 }
