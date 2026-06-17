@@ -1,6 +1,8 @@
 use anyhow::Result;
 use futures_util::StreamExt;
-use tokio::process::ChildStdout;
+use std::process::Stdio;
+use tokio::io::AsyncWriteExt;
+use tokio::process::{ChildStdout, Command};
 use tokio_util::codec::{FramedRead, LinesCodec};
 
 pub async fn output_readable_stream(mut stream: FramedRead<ChildStdout, LinesCodec>) -> Result<()> {
@@ -8,6 +10,29 @@ pub async fn output_readable_stream(mut stream: FramedRead<ChildStdout, LinesCod
         println!("{}", line?);
     }
     Ok(())
+}
+
+pub async fn pipe_nom(
+    mut stream: FramedRead<ChildStdout, LinesCodec>,
+) -> Result<FramedRead<ChildStdout, LinesCodec>> {
+    let mut child = Command::new("nom")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+
+    let mut stdin = child.stdin.take().expect("nom stdin should be piped");
+    tokio::spawn(async move {
+        while let Some(line) = stream.next().await {
+            let line = line?;
+            stdin.write_all(line.as_bytes()).await?;
+            stdin.write_all(b"\n").await?;
+        }
+        stdin.shutdown().await?;
+        anyhow::Ok(())
+    });
+
+    let stdout = child.stdout.take().expect("nom stdout should be piped");
+    Ok(FramedRead::new(stdout, LinesCodec::new()))
 }
 
 #[cfg(test)]
