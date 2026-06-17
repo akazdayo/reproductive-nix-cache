@@ -1,4 +1,5 @@
 use anyhow::{Context, anyhow};
+use std::fmt;
 use std::process::{Command as ProcessCommand, Stdio};
 use tokio::process::{ChildStdout, Command};
 use tokio_util::codec::{FramedRead, LinesCodec};
@@ -22,6 +23,16 @@ pub fn run_nix(args: &[&str]) -> anyhow::Result<String> {
 pub enum NixBuildError {
     FailedGetStdoutStream,
 }
+
+impl fmt::Display for NixBuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NixBuildError::FailedGetStdoutStream => write!(f, "failed to get stdout stream"),
+        }
+    }
+}
+
+impl std::error::Error for NixBuildError {}
 
 pub async fn run_build(
     package_ref: &str,
