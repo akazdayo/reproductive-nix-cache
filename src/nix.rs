@@ -123,5 +123,14 @@ mod tests {
     }
 
     #[test]
-    fn test_nix_build_cache() {}
+    fn test_nix_build_cache() -> anyhow::Result<()> {
+        run_build("nixpkgs#hello", false)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_nix_full_build_cache() -> anyhow::Result<()> {
+        run_build("nixpkgs#hello", true)?;
+        Ok(())
+    }
 }
