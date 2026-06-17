@@ -60,13 +60,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_nix_help() -> anyhow::Result<()> {
-        let resp = run_nix(&["--help"]);
-        if let Err(err) = resp {
-            panic!("ERROR: {:?}", err)
-        }
-        println!("{:?}", resp?);
-        Ok(())
+    fn test_nix_help() {
+        assert!(run_nix(&["--help"]).is_ok())
     }
 
     #[test]
