@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::process::Command as ProcessCommand;
+use std::process::{Command as ProcessCommand, Stdio};
 
 use anyhow::{Context, anyhow};
 
@@ -22,7 +22,7 @@ pub fn run_nix(args: &[&str]) -> anyhow::Result<String> {
 
 /// Build the given package reference.  Falls back from `nom` to `nix` if
 /// `nom` is not on PATH.
-pub fn run_build(package_ref: &str, full_rebuild: bool) -> anyhow::Result<()> {
+pub fn run_build(package_ref: &str, full_rebuild: bool, quiet: bool) -> anyhow::Result<()> {
     let mut args: Vec<&str> = vec!["build"];
     if full_rebuild {
         args.extend(["--rebuild", "--option", "substitute", "false"]);
@@ -30,11 +30,26 @@ pub fn run_build(package_ref: &str, full_rebuild: bool) -> anyhow::Result<()> {
     args.push(package_ref);
     args.push("--no-link");
 
-    let status = ProcessCommand::new("nom")
-        .args(&args)
-        .status()
-        .or_else(|_| ProcessCommand::new("nix").args(&args).status())
-        .map_err(|_| anyhow!("failed to execute build command; is nix installed and on PATH?"))?;
+    let status = if quiet {
+        ProcessCommand::new("nom")
+            .args(&args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .or_else(|_| {
+                ProcessCommand::new("nix")
+                    .args(&args)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+            })
+    } else {
+        ProcessCommand::new("nom")
+            .args(&args)
+            .status()
+            .or_else(|_| ProcessCommand::new("nix").args(&args).status())
+    }
+    .map_err(|_| anyhow!("failed to execute build command; is nix installed and on PATH?"))?;
 
     if !status.success() {
         return Err(anyhow!(
@@ -124,13 +139,13 @@ mod tests {
 
     #[test]
     fn test_nix_build_cache() -> anyhow::Result<()> {
-        run_build("nixpkgs#hello", false)?;
+        run_build("nixpkgs#hello", false, true)?;
         Ok(())
     }
 
     #[test]
     fn test_nix_full_build_cache() -> anyhow::Result<()> {
-        run_build("nixpkgs#hello", true)?;
+        run_build("nixpkgs#hello", true, true)?;
         Ok(())
     }
 }

@@ -54,7 +54,7 @@ pub fn build_evidence(package_ref: &str, full_rebuild: bool) -> anyhow::Result<N
         .context("failed to parse `nix derivation show` output")?;
     let derivation = nix::select_derivation(derivation_map, &drv_path)?;
 
-    nix::run_build(package_ref, full_rebuild)?;
+    nix::run_build(package_ref, full_rebuild, true)?;
 
     let output_path_info_json = nix::run_nix(&["path-info", "--json", package_ref])?;
     let (store_path, nar_hash) =
