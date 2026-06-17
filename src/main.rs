@@ -1,7 +1,7 @@
 mod build_test;
-mod evidence;
 mod models;
 mod nix;
+mod utils;
 
 use clap::{Parser, Subcommand};
 
@@ -23,16 +23,14 @@ enum Command {
     },
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Build {
             package_ref,
             full_rebuild,
-        } => {
-            let evidence = evidence::build_evidence(&package_ref, full_rebuild)?;
-            println!("{}", serde_json::to_string_pretty(&evidence)?);
-        }
+        } => {}
     }
     Ok(())
 }

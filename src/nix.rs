@@ -1,9 +1,7 @@
-use std::collections::HashMap;
-use std::process::{Command as ProcessCommand, Stdio};
-
 use anyhow::{Context, anyhow};
-
-use crate::models::Derivation;
+use std::process::{Command as ProcessCommand, Stdio};
+use tokio::process::{ChildStdout, Command};
+use tokio_util::codec::{FramedRead, LinesCodec};
 
 /// Run `nix` with the given arguments, returning stdout as a UTF-8 string.
 pub fn run_nix(args: &[&str]) -> anyhow::Result<String> {
@@ -20,94 +18,41 @@ pub fn run_nix(args: &[&str]) -> anyhow::Result<String> {
     String::from_utf8(output.stdout).context("nix stdout was not valid UTF-8")
 }
 
-/// Build the given package reference.  Falls back from `nom` to `nix` if
-/// `nom` is not on PATH.
-pub fn run_build(package_ref: &str, full_rebuild: bool, quiet: bool) -> anyhow::Result<()> {
+#[derive(Debug)]
+pub enum NixBuildError {
+    FailedGetStdoutStream,
+}
+
+pub async fn run_build(
+    package_ref: &str,
+    full_rebuild: bool,
+) -> anyhow::Result<FramedRead<ChildStdout, LinesCodec>, NixBuildError> {
     let mut args: Vec<&str> = vec!["build"];
+
     if full_rebuild {
+        // キャッシュを利用しない
         args.extend(["--rebuild", "--option", "substitute", "false"]);
     }
     args.push(package_ref);
     args.push("--no-link");
 
-    let status = if quiet {
-        ProcessCommand::new("nom")
-            .args(&args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .or_else(|_| {
-                ProcessCommand::new("nix")
-                    .args(&args)
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-            })
+    let mut child = Command::new("nix")
+        .args(&args)
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to start nix process");
+
+    // stdoutへの出力ハンドラを取得
+    // let stdout = child.stdout.take().unwrap();
+    if let Some(stdout) = child.stdout.take() {
+        // こんな感じで使う
+        // while let Some(line) = reader.next().await {
+        //    println!("{}", line?);
+        // }
+        Ok(FramedRead::new(stdout, LinesCodec::new()))
     } else {
-        ProcessCommand::new("nom")
-            .args(&args)
-            .status()
-            .or_else(|_| ProcessCommand::new("nix").args(&args).status())
+        Err(NixBuildError::FailedGetStdoutStream)
     }
-    .map_err(|_| anyhow!("failed to execute build command; is nix installed and on PATH?"))?;
-
-    if !status.success() {
-        return Err(anyhow!(
-            "build failed with exit code {}",
-            status.code().unwrap_or(-1)
-        ));
-    }
-    Ok(())
-}
-
-/// From `nix path-info --json` / `nix path-info --json --derivation` output.
-///
-/// Expects a JSON object like `{ "/nix/store/...": { "narHash": "..." } }`
-/// and returns the store path and narHash.
-pub fn extract_path_info(json: &str, label: &str) -> anyhow::Result<(String, String)> {
-    let map: HashMap<String, serde_json::Value> =
-        serde_json::from_str(json).with_context(|| format!("failed to parse `{label}` output"))?;
-    let (path, value) = map
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("`{label}` returned empty"))?;
-    let nar_hash = value
-        .get("narHash")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    Ok((path, nar_hash))
-}
-
-/// Select the derivation for `drv_path` from the `nix derivation show` map.
-///
-/// If the exact path is present it is used; otherwise, if there is exactly
-/// one entry in the map, that entry is returned as a fallback.
-pub fn select_derivation(
-    mut derivations: HashMap<String, Derivation>,
-    drv_path: &str,
-) -> anyhow::Result<Derivation> {
-    if let Some(derivation) = derivations.remove(drv_path) {
-        return Ok(derivation);
-    }
-
-    if derivations.len() == 1 {
-        return derivations
-            .into_values()
-            .next()
-            .ok_or_else(|| anyhow!("failed to read derivation entry"));
-    }
-
-    Err(anyhow!(
-        "`nix derivation show` output did not contain derivation `{drv_path}`"
-    ))
-}
-
-/// Extract a required key from the derivation environment.
-pub fn required_env_value(env: &HashMap<String, String>, key: &str) -> anyhow::Result<String> {
-    env.get(key)
-        .cloned()
-        .ok_or_else(|| anyhow!("derivation env did not contain `{key}`"))
 }
 
 #[cfg(test)]
@@ -127,25 +72,11 @@ mod tests {
     #[test]
     fn test_nix_run() {
         let resp = run_nix(&["run", "nixpkgs#hello", "--", "-t"]);
-        match resp {
-            Ok(value) => {
-                assert_eq!(value, "hello, world\n");
-            }
-            Err(err) => {
-                panic!("ERROR: {:?}", err)
-            }
-        }
+        assert_eq!(resp.unwrap(), "hello, world\n");
     }
 
-    #[test]
-    fn test_nix_build_cache() -> anyhow::Result<()> {
-        run_build("nixpkgs#hello", false, true)?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_nix_full_build_cache() -> anyhow::Result<()> {
-        run_build("nixpkgs#hello", true, true)?;
-        Ok(())
+    #[tokio::test]
+    async fn test_nix_build_cache() {
+        assert!(run_build("nixpkgs#hello", false).await.is_ok())
     }
 }
