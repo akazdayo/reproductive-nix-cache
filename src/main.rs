@@ -34,15 +34,17 @@ async fn main() -> anyhow::Result<()> {
             full_rebuild,
             quiet,
         } => {
-            build_test::generate_evidence(
+            let result = build_test::generate_evidence(
                 build_test::Package {
                     name: package_ref,
                     repositry: String::new(),
                 },
                 vec![build_test::Evidence::Logs],
+                full_rebuild,
                 quiet,
             )
             .await?;
+            println!("{:?}", result);
         }
     }
     Ok(())

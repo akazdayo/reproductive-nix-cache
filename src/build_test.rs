@@ -23,9 +23,10 @@ pub enum Evidence {
 pub async fn generate_evidence(
     package: Package,
     evidences: Vec<Evidence>,
+    full_rebuild: bool,
     quiet: bool,
 ) -> Result<Output> {
-    let nix_stream = nix::run_build(&package.name, true).await?;
+    let nix_stream = nix::run_build(&package.name, full_rebuild).await?;
     let nom_stream = utils::pipe_nom(nix_stream).await?;
     if !quiet {
         utils::output_readable_stream(nom_stream).await?;
