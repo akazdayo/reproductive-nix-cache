@@ -9,8 +9,8 @@ pub struct Output {
 
 #[derive(Debug)]
 pub struct Package {
-    name: String,
-    repositry: String,
+    pub name: String,
+    pub repositry: String,
 }
 
 #[derive(Debug)]
