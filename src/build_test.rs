@@ -1,28 +1,30 @@
-use crate::nix;
+use crate::{nix, utils};
 use anyhow::Result;
 
 #[derive(Debug)]
-struct Output {
+pub struct Output {
     package: Package,
     evidence: Evidence,
 }
 
 #[derive(Debug)]
-struct Package {
+pub struct Package {
     name: String,
     repositry: String,
 }
 
 #[derive(Debug)]
-enum Evidence {
+pub enum Evidence {
     TEE,
     Zk,
     Logs,
 }
 
 pub async fn generate_evidence(package: Package, evidences: Vec<Evidence>) -> Result<Output> {
-    let build = nix::run_build(&package.name, true).await;
-    //nix::wait_build(build).await?;
+    let nix_stream = nix::run_build(&package.name, true).await?;
+    let nom_stream = utils::pipe_nom(nix_stream).await?;
+    utils::output_readable_stream(nom_stream).await?;
+
     Ok(Output {
         package,
         evidence: evidences.into_iter().next().unwrap_or(Evidence::Logs),

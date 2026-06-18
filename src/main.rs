@@ -31,8 +31,7 @@ async fn main() -> anyhow::Result<()> {
             package_ref,
             full_rebuild,
         } => {
-            let stream = nix::run_build(&package_ref, full_rebuild).await?;
-            utils::output_readable_stream(stream).await?;
+            build_test::generate_evidence(build_test::Package(name: &package_ref, repository: String::new("")), vec![build_test::Evidence::Logs])?;
         }
     }
     Ok(())
