@@ -50,6 +50,7 @@ pub async fn run_build(
     let mut child = Command::new("nix")
         .args(&args)
         .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
         .expect("failed to start nix process");
 

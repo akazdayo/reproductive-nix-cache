@@ -20,6 +20,8 @@ enum Command {
         /// Rebuild all dependencies from scratch (no cache, no substitutes)
         #[arg(long)]
         full_rebuild: bool,
+        #[arg(long)]
+        quiet: bool,
     },
 }
 
@@ -30,6 +32,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Build {
             package_ref,
             full_rebuild,
+            quiet,
         } => {
             build_test::generate_evidence(
                 build_test::Package {
@@ -37,6 +40,7 @@ async fn main() -> anyhow::Result<()> {
                     repositry: String::new(),
                 },
                 vec![build_test::Evidence::Logs],
+                quiet,
             )
             .await?;
         }

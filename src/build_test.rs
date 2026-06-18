@@ -20,10 +20,16 @@ pub enum Evidence {
     Logs,
 }
 
-pub async fn generate_evidence(package: Package, evidences: Vec<Evidence>) -> Result<Output> {
+pub async fn generate_evidence(
+    package: Package,
+    evidences: Vec<Evidence>,
+    quiet: bool,
+) -> Result<Output> {
     let nix_stream = nix::run_build(&package.name, true).await?;
     let nom_stream = utils::pipe_nom(nix_stream).await?;
-    utils::output_readable_stream(nom_stream).await?;
+    if !quiet {
+        utils::output_readable_stream(nom_stream).await?;
+    }
 
     Ok(Output {
         package,
