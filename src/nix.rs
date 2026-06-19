@@ -1,23 +1,8 @@
-use anyhow::{Context, anyhow};
-use std::process::{Command as ProcessCommand, Stdio};
+use anyhow::Result;
+use std::process::Stdio;
 use thiserror::Error;
 use tokio::process::{ChildStdout, Command};
 use tokio_util::codec::{FramedRead, LinesCodec};
-
-/// Run `nix` with the given arguments, returning stdout as a UTF-8 string.
-pub fn run_nix(args: &[&str]) -> anyhow::Result<String> {
-    let output = ProcessCommand::new("nix")
-        .args(args)
-        .output()
-        .map_err(|_| anyhow!("failed to execute nix; is nix installed and on PATH?"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("nix command failed: {stderr}"));
-    }
-
-    String::from_utf8(output.stdout).context("nix stdout was not valid UTF-8")
-}
 
 #[derive(Debug, Error)]
 pub enum NixBuildError {
@@ -28,7 +13,7 @@ pub enum NixBuildError {
 pub async fn run_build(
     package_ref: &str,
     full_rebuild: bool,
-) -> anyhow::Result<FramedRead<ChildStdout, LinesCodec>, NixBuildError> {
+) -> Result<FramedRead<ChildStdout, LinesCodec>, NixBuildError> {
     let mut args: Vec<&str> = vec!["build"];
 
     if full_rebuild {
@@ -61,17 +46,6 @@ pub async fn run_build(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_nix_help() {
-        assert!(run_nix(&["--help"]).is_ok())
-    }
-
-    #[test]
-    fn test_nix_run() {
-        let resp = run_nix(&["run", "nixpkgs#hello", "--", "-t"]);
-        assert_eq!(resp.unwrap(), "hello, world\n");
-    }
 
     #[tokio::test]
     async fn test_nix_build_cache() {
