@@ -24,10 +24,15 @@ pub async fn generate_evidence(
     full_rebuild: bool,
     quiet: bool,
 ) -> Result<Output> {
-    let nix_stream = nix::run_build(&package.name, full_rebuild).await?;
-    let nom_stream = utils::pipe_nom(nix_stream).await?;
-    if !quiet {
-        utils::output_readable_stream(nom_stream).await?;
+    let mut nix_child = nix::run_build(&package, full_rebuild).await?;
+    let nix_stdio = utils::get_stdio(&mut nix_child)?;
+    if let Some(stdout) = nix_stdio.stdout
+        && !quiet
+    {
+        utils::output_readable_stream(utils::pipe_nom(stdout).await?).await?;
+        nix_child.wait().await?;
+    } else {
+        nix_child.wait().await?;
     }
 
     Ok(Output {

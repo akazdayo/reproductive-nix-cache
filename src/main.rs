@@ -1,5 +1,4 @@
 mod build_test;
-mod models;
 mod nix;
 mod utils;
 

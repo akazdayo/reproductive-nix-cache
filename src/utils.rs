@@ -1,13 +1,13 @@
 use crate::build_test::Package;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use futures_util::StreamExt;
 use regex::Regex;
 use std::process::Stdio;
 use std::sync::OnceLock;
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
-use tokio::process::{ChildStdout, Command};
-use tokio_util::codec::{FramedRead, LinesCodec};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 
 pub async fn output_readable_stream(mut stream: FramedRead<ChildStdout, LinesCodec>) -> Result<()> {
     while let Some(line) = stream.next().await {
@@ -55,6 +55,44 @@ pub fn parse_nix_repository(input: &str) -> Option<Package> {
     Some(Package {
         repository: caps.name("repo")?.as_str().to_string(),
         name: caps.name("package")?.as_str().to_string(),
+    })
+}
+
+pub struct ShellOutput {
+    pub stdout: Option<FramedRead<ChildStdout, LinesCodec>>,
+    pub stderr: Option<FramedRead<ChildStderr, LinesCodec>>,
+    pub stdin: Option<FramedWrite<ChildStdin, LinesCodec>>,
+}
+
+pub fn get_stdio(child: &mut Child) -> Result<ShellOutput> {
+    let stdout = match child.stdout.take() {
+        Some(val) => Some(val),
+        None => None,
+    };
+
+    let stderr = match child.stderr.take() {
+        Some(val) => Some(val),
+        None => None,
+    };
+
+    let stdin = match child.stdin.take() {
+        Some(val) => Some(val),
+        None => None,
+    };
+
+    Ok(ShellOutput {
+        stdout: match stdout {
+            Some(val) => Some(FramedRead::new(val, LinesCodec::new())),
+            None => None,
+        },
+        stderr: match stderr {
+            Some(val) => Some(FramedRead::new(val, LinesCodec::new())),
+            None => None,
+        },
+        stdin: match stdin {
+            Some(val) => Some(FramedWrite::new(val, LinesCodec::new())),
+            None => None,
+        },
     })
 }
 
