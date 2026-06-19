@@ -33,19 +33,21 @@ async fn main() -> anyhow::Result<()> {
             package_ref,
             full_rebuild,
             quiet,
-        } => {
-            let result = build_test::generate_evidence(
-                build_test::Package {
-                    name: package_ref,
-                    repositry: String::new(),
-                },
-                vec![build_test::Evidence::Logs],
-                full_rebuild,
-                quiet,
-            )
-            .await?;
-            println!("{:?}", result);
-        }
+        } => match utils::parse_nix_repository(&package_ref) {
+            Some(pkg) => {
+                let result = build_test::generate_evidence(
+                    pkg,
+                    vec![build_test::Evidence::Logs],
+                    full_rebuild,
+                    quiet,
+                )
+                .await?;
+                println!("{:?}", result);
+            }
+            None => {
+                panic!("Parse Error!")
+            }
+        },
     }
     Ok(())
 }
