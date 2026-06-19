@@ -45,22 +45,17 @@ enum ParseNixRepositoryError {
     FailedToParse,
 }
 
-pub fn parse_nix_repository(input: &str) -> Result<Option<Package>, ParseNixRepositoryError> {
+pub fn parse_nix_repository(input: &str) -> Option<Package> {
     static RE: OnceLock<Regex> = OnceLock::new();
 
     let re = RE.get_or_init(|| Regex::new(r"^(?P<repo>[^#\s]+)#(?P<package>[^#\s]+)$").unwrap());
 
-    if let Some(caps) = re.captures(input) {
-        if let (Some(repo), Some(package)) = (caps.name("repo"), caps.name("package")) {
-            return Ok(Some(Package {
-                repository: repo.as_str().to_string(),
-                name: package.as_str().to_string(),
-            }));
-        } else {
-            return Ok(None);
-        }
-    }
-    Err(ParseNixRepositoryError::FailedToParse)
+    let caps = re.captures(input)?;
+
+    Some(Package {
+        repository: caps.name("repo")?.as_str().to_string(),
+        name: caps.name("package")?.as_str().to_string(),
+    })
 }
 
 #[cfg(test)]
