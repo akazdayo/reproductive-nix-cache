@@ -1,6 +1,10 @@
+use crate::build_test::Package;
 use anyhow::Result;
 use futures_util::StreamExt;
+use regex::Regex;
 use std::process::Stdio;
+use std::sync::OnceLock;
+use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::process::{ChildStdout, Command};
 use tokio_util::codec::{FramedRead, LinesCodec};
@@ -33,6 +37,30 @@ pub async fn pipe_nom(
 
     let stdout = child.stdout.take().expect("nom stdout should be piped");
     Ok(FramedRead::new(stdout, LinesCodec::new()))
+}
+
+#[derive(Debug, Error)]
+enum ParseNixRepositoryError {
+    #[error("Failed to parse nix repository")]
+    FailedToParse,
+}
+
+pub fn parse_nix_repository(input: &str) -> Result<Option<Package>, ParseNixRepositoryError> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+
+    let re = RE.get_or_init(|| Regex::new(r"^(?P<repo>[^#\s]+)#(?P<package>[^#\s]+)$").unwrap());
+
+    if let Some(caps) = re.captures(input) {
+        if let (Some(repo), Some(package)) = (caps.name("repo"), caps.name("package")) {
+            return Ok(Some(Package {
+                repository: repo.as_str().to_string(),
+                name: package.as_str().to_string(),
+            }));
+        } else {
+            return Ok(None);
+        }
+    }
+    Err(ParseNixRepositoryError::FailedToParse)
 }
 
 #[cfg(test)]

@@ -10,13 +10,11 @@ pub struct Output {
 #[derive(Debug)]
 pub struct Package {
     pub name: String,
-    pub repositry: String,
+    pub repository: String,
 }
 
 #[derive(Debug)]
 pub enum Evidence {
-    TEE,
-    Zk,
     Logs,
 }
 
