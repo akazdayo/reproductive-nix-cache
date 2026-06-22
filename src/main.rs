@@ -1,5 +1,5 @@
-mod build_test;
-mod nix;
+mod build;
+mod model;
 mod utils;
 
 use clap::{Parser, Subcommand};
@@ -34,9 +34,9 @@ async fn main() -> anyhow::Result<()> {
             quiet,
         } => match utils::parse_nix_repository(&package_ref) {
             Some(pkg) => {
-                let result = build_test::generate_evidence(
+                let result = build::evidence::generate_evidence(
                     pkg,
-                    vec![build_test::Evidence::Logs],
+                    vec![build::model::Evidences::Logs],
                     full_rebuild,
                     quiet,
                 )

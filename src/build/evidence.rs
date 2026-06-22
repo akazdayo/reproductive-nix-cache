@@ -1,26 +1,11 @@
-use crate::{nix, utils};
+use crate::build::model::{Evidences, Output, Package};
+use crate::build::nix;
+use crate::utils;
 use anyhow::Result;
-
-#[derive(Debug)]
-pub struct Output {
-    package: Package,
-    evidence: Evidence,
-}
-
-#[derive(Debug)]
-pub struct Package {
-    pub name: String,
-    pub repository: String,
-}
-
-#[derive(Debug)]
-pub enum Evidence {
-    Logs,
-}
 
 pub async fn generate_evidence(
     package: Package,
-    evidences: Vec<Evidence>,
+    evidences: Vec<Evidences>,
     full_rebuild: bool,
     quiet: bool,
 ) -> Result<Output> {
@@ -37,6 +22,6 @@ pub async fn generate_evidence(
 
     Ok(Output {
         package,
-        evidence: evidences.into_iter().next().unwrap_or(Evidence::Logs),
+        evidences: evidences.into_iter().next().unwrap_or(Evidences::Logs),
     })
 }

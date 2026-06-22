@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::process::Stdio;
 use tokio::process::{Child, Command};
 
-use crate::build_test::Package;
+use crate::build::model::Package;
 
 pub async fn run_build(package: &Package, full_rebuild: bool) -> Result<Child> {
     let mut args: Vec<&str> = vec!["build"];
