@@ -22,9 +22,12 @@ pub async fn generate_evidence(
         bail!("nix build failed with exit status: {status}");
     }
 
+    let path_info = nix::get_path_info(&package).await?;
+
     Ok(Output {
         package,
         evidences: evidences.into_iter().next().unwrap_or(Evidences::Logs),
+        nar_hash: path_info.nar_hash,
     })
 }
 
