@@ -4,7 +4,6 @@ use futures_util::StreamExt;
 use regex::Regex;
 use std::process::Stdio;
 use std::sync::OnceLock;
-use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
@@ -37,12 +36,6 @@ pub async fn pipe_nom(
 
     let stdout = child.stdout.take().expect("nom stdout should be piped");
     Ok(FramedRead::new(stdout, LinesCodec::new()))
-}
-
-#[derive(Debug, Error)]
-enum ParseNixRepositoryError {
-    #[error("Failed to parse nix repository")]
-    FailedToParse,
 }
 
 pub fn parse_nix_repository(input: &str) -> Option<Package> {
