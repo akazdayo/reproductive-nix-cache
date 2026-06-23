@@ -35,7 +35,19 @@ mod tests {
             repository: "nixpkgs".to_string(),
             name: "hello".to_string(),
         };
-        assert!(run_build(&pkg, false).await.is_ok())
-        // TODO: stderrをハンドルしてないので後で直す
+        let mut child = run_build(&pkg, false).await.unwrap();
+        let status = child.wait().await.unwrap();
+        assert!(status.success(), "nix build should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_nix_build_nonexistent_package_fails() {
+        let pkg = Package {
+            repository: "nixpkgs".to_string(),
+            name: "this-package-should-not-exist-ever-99999".to_string(),
+        };
+        let mut child = run_build(&pkg, false).await.unwrap();
+        let status = child.wait().await.unwrap();
+        assert!(!status.success(), "build of nonexistent package should fail");
     }
 }
