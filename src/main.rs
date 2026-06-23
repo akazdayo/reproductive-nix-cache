@@ -41,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
                     quiet,
                 )
                 .await?;
-                println!("{:?}", result);
+                println!("{}", serde_json::to_string_pretty(&result)?);
             }
             None => {
                 panic!("Parse Error!")
