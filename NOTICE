@@ -1,0 +1,11 @@
+reproductive-nix-cache
+
+This project is licensed under the MIT License. See LICENSE.
+
+This project contains code and design adapted from Attic:
+https://github.com/zhaofengli/attic
+
+Attic is licensed under the Apache License, Version 2.0.
+See LICENSES/Apache-2.0-Attic.txt.
+
+Copyright 2022 Zhaofeng Li and the Attic contributors
