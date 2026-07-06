@@ -1,11 +1,18 @@
+mod cli;
+mod config;
 use axum::{Router, routing::get};
+use clap::Parser;
 use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let cli = cli::Cli::parse();
+
     let app = Router::new().route("/", get(health));
 
-    let listener = TcpListener::bind("127.0.0.1:3000").await?;
+    let config = config::Config::default();
+    let listen = cli.listen.unwrap_or(config.listen_addr);
+    let listener = TcpListener::bind(listen).await?;
     axum::serve(listener, app).await?;
 
     Ok(())
