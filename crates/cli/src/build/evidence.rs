@@ -1,5 +1,5 @@
 use crate::build::nix;
-use crate::evidences::EvidenceExt;
+use crate::claims::{CalcClaim, EvidenceClaim};
 use crate::utils;
 use anyhow::{Result, bail};
 use shared::{Evidences, Output, Package};
@@ -25,14 +25,16 @@ pub async fn generate_evidence(
 
     let path_info = nix::get_path_info(&package).await?;
 
-    let evidence = evidences.into_iter().next().unwrap_or(Evidences::Logs);
-    let _claim = evidence.claim();
+    let evidence = evidences.into_iter().next().unwrap_or(Evidences::Logs(None));
+    let _claim_name = evidence.claim();
 
-    Ok(Output {
+    let output = Output {
         package,
-        evidences: evidence,
+        evidences: evidence.clone(),
         nar_hash: path_info.nar_hash,
-    })
+    };
+
+    Ok(CalcClaim::new(evidence, output).into_output())
 }
 
 #[cfg(test)]
@@ -45,7 +47,7 @@ mod tests {
             repository: "nixpkgs".to_string(),
             name: "this-package-should-not-exist-ever-99999".to_string(),
         };
-        let result = generate_evidence(pkg, vec![Evidences::Logs], false, true).await;
+        let result = generate_evidence(pkg, vec![Evidences::Logs(None)], false, true).await;
         assert!(
             result.is_err(),
             "generate_evidence should return Err for nonexistent package"

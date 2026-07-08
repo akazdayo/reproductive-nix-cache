@@ -18,8 +18,17 @@ pub struct Package {
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
 pub struct LogsClaim {
-    log: String,
-    timestamp: DateTime<Utc>,
+    pub log: String,
+    pub timestamp: DateTime<Utc>,
+}
+
+impl LogsClaim {
+    pub fn new(log: impl Into<String>) -> Self {
+        Self {
+            log: log.into(),
+            timestamp: Utc::now(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
