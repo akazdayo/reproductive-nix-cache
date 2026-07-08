@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+shared = { path = "../shared" }
 anyhow.workspace = true
 clap.workspace = true
 futures-util.workspace = true

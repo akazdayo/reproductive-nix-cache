@@ -1,5 +1,5 @@
-use crate::build::model::{Evidences, Output, Package};
 use crate::build::nix;
+use shared::{Evidences, Output, Package};
 use crate::utils;
 use anyhow::{Result, bail};
 

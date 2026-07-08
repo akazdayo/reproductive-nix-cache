@@ -193,6 +193,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "shared",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -612,7 +613,15 @@ dependencies = [
  "clap",
  "serde",
  "serde_json",
+ "shared",
  "tokio",
+]
+
+[[package]]
+name = "shared"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

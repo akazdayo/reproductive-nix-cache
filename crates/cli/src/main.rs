@@ -36,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
             Some(pkg) => {
                 let result = build::evidence::generate_evidence(
                     pkg,
-                    vec![build::model::Evidences::Logs],
+                    vec![shared::Evidences::Logs],
                     full_rebuild,
                     quiet,
                 )

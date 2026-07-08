@@ -1,5 +1,5 @@
-use crate::build::model::Package;
 use anyhow::Result;
+use shared::Package;
 use futures_util::StreamExt;
 use regex::Regex;
 use std::process::Stdio;

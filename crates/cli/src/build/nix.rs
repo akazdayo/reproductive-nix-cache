@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use std::process::Stdio;
 use tokio::process::{Child, Command};
 
-use crate::build::model::{NixPathInfo, Package};
+use crate::build::model::NixPathInfo;
+use shared::Package;
 
 async fn run_shell(command: &str, args: Vec<&str>) -> Result<Child> {
     let child = Command::new(command)
