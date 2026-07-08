@@ -5,4 +5,5 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+chrono = { version = "0.4.45", features = ["serde"] }
 serde.workspace = true

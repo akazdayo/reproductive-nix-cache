@@ -1,7 +1,7 @@
 use anyhow::Result;
-use shared::Package;
 use futures_util::StreamExt;
 use regex::Regex;
+use shared::Package;
 use std::process::Stdio;
 use std::sync::OnceLock;
 use tokio::io::AsyncWriteExt;

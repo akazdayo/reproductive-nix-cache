@@ -1,3 +1,3 @@
 pub mod evidence;
 
-pub use evidence::{Evidences, Output, Package};
+pub use evidence::{Evidences, LogsClaim, Output, Package};
