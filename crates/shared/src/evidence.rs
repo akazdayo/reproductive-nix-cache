@@ -1,4 +1,7 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::net::IpAddr;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Output {
@@ -13,9 +16,15 @@ pub struct Package {
     pub repository: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
+pub struct LogsClaim {
+    log: String,
+    timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Evidences {
-    Logs,
-    IP,
+    Logs(Option<LogsClaim>),
+    IP(Option<HashSet<IpAddr>>),
 }
