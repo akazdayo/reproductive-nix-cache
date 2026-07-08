@@ -25,7 +25,10 @@ pub async fn generate_evidence(
 
     let path_info = nix::get_path_info(&package).await?;
 
-    let evidence = evidences.into_iter().next().unwrap_or(Evidences::Logs(None));
+    let evidence = evidences
+        .into_iter()
+        .next()
+        .unwrap_or(Evidences::Logs(None));
     let _claim_name = evidence.claim();
 
     let output = Output {
