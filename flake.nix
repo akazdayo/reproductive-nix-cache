@@ -7,6 +7,14 @@
       url = "https://flakehub.com/f/nix-community/fenix/0.1";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    git-hooks = {
+      url = "github:cachix/git-hooks.nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    treefmt-nix = {
+      url = "github:numtide/treefmt-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
@@ -49,21 +57,40 @@
           );
       };
 
+      checks = forEachSupportedSystem (
+        { system, ... }:
+        {
+          pre-commit-check = inputs.git-hooks.lib.${system}.run {
+            src = ./.;
+            hooks = {
+              treefmt = {
+                enable = true;
+                package = self.formatter.${system};
+              };
+            };
+          };
+        }
+      );
+
       devShells = forEachSupportedSystem (
         { pkgs, system }:
         {
           default = pkgs.mkShell {
-            packages = with pkgs; [
-              rustToolchain
-              openssl
-              pkg-config
-              cargo-deny
-              cargo-edit
-              cargo-watch
-              rust-analyzer
-              nix-output-monitor
-              self.formatter.${system}
-            ];
+            packages =
+              (with pkgs; [
+                rustToolchain
+                openssl
+                pkg-config
+                cargo-deny
+                cargo-edit
+                cargo-watch
+                rust-analyzer
+                nix-output-monitor
+                self.formatter.${system}
+              ])
+              ++ self.checks.${system}.pre-commit-check.enabledPackages;
+
+            shellHook = self.checks.${system}.pre-commit-check.shellHook;
 
             env = {
               # Required by rust-analyzer
@@ -73,6 +100,15 @@
         }
       );
 
-      formatter = forEachSupportedSystem ({ pkgs, ... }: pkgs.nixfmt);
+      formatter = forEachSupportedSystem (
+        { pkgs, ... }:
+        inputs.treefmt-nix.lib.mkWrapper pkgs {
+          projectRootFile = "flake.nix";
+          programs = {
+            nixfmt.enable = true;
+            rustfmt.enable = true;
+          };
+        }
+      );
     };
 }
