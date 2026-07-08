@@ -1,7 +1,8 @@
 use crate::build::nix;
-use shared::{Evidences, Output, Package};
+use crate::evidences::EvidenceExt;
 use crate::utils;
 use anyhow::{Result, bail};
+use shared::{Evidences, Output, Package};
 
 pub async fn generate_evidence(
     package: Package,
@@ -24,9 +25,12 @@ pub async fn generate_evidence(
 
     let path_info = nix::get_path_info(&package).await?;
 
+    let evidence = evidences.into_iter().next().unwrap_or(Evidences::Logs);
+    let _claim = evidence.claim();
+
     Ok(Output {
         package,
-        evidences: evidences.into_iter().next().unwrap_or(Evidences::Logs),
+        evidences: evidence,
         nar_hash: path_info.nar_hash,
     })
 }

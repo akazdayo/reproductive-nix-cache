@@ -1,5 +1,5 @@
 mod build;
-mod model;
+mod evidences;
 mod utils;
 
 use clap::{Parser, Subcommand};

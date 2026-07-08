@@ -17,4 +17,5 @@ pub struct Package {
 #[serde(rename_all = "lowercase")]
 pub enum Evidences {
     Logs,
+    IP,
 }
