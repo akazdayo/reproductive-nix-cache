@@ -1,2 +1,5 @@
 /target
+.direnv/
 .pre-commit-config.yaml
+reproductive-nix-cache.sqlite
+reproductive-nix-cache.sqlite-*

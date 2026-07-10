@@ -1,3 +1,6 @@
 pub mod evidence;
 
-pub use evidence::{Evidences, LogsClaim, Output, Package};
+pub use evidence::{
+    BuildEvidence, EVIDENCE_SCHEMA_VERSION, EvidenceList, EvidenceReceipt, Package, ResolvedSource,
+    StoredEvidence,
+};

@@ -4,11 +4,25 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "reproductive-nix-cache-server"
+path = "src/main.rs"
+
 [dependencies]
 shared = { path = "../shared" }
 clap.workspace = true
 anyhow.workspace = true
 axum = "0.8.9"
+chrono.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sea-orm = { version = "1.1.20", default-features = false, features = [
+    "macros",
+    "runtime-tokio-rustls",
+    "sqlx-sqlite",
+    "with-chrono",
+] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

@@ -1,17 +1,16 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, path::PathBuf};
 
-use serde::Deserialize;
-
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 pub struct Config {
-    #[serde(default = "default_listen_address")]
     pub listen_addr: SocketAddr,
+    pub database_path: PathBuf,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             listen_addr: default_listen_address(),
+            database_path: PathBuf::from("reproductive-nix-cache.sqlite"),
         }
     }
 }

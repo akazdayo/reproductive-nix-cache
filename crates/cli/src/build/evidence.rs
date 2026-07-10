@@ -1,59 +1,34 @@
 use crate::build::nix;
-use crate::claims::{CalcClaim, EvidenceClaim};
-use crate::utils;
 use anyhow::{Result, bail};
-use shared::{Evidences, Output, Package};
+use chrono::Utc;
+use shared::{BuildEvidence, EVIDENCE_SCHEMA_VERSION, Package};
 
+/// Rebuild an output without substitutes, then collect the facts needed to
+/// compare it with reports from other builders.
 pub async fn generate_evidence(
     package: Package,
-    evidences: Vec<Evidences>,
-    full_rebuild: bool,
+    builder_id: String,
     quiet: bool,
-) -> Result<Output> {
-    let mut nix_child = nix::run_build(&package, full_rebuild).await?;
-    let nix_stdio = utils::get_stdio(&mut nix_child)?;
-    if let Some(stdout) = nix_stdio.stdout
-        && !quiet
-    {
-        utils::output_readable_stream(utils::pipe_nom(stdout).await?).await?;
+) -> Result<BuildEvidence> {
+    if builder_id.trim().is_empty() {
+        bail!("builder_id must not be empty");
     }
 
-    let status = nix_child.wait().await?;
-    if !status.success() {
-        bail!("nix build failed with exit status: {status}");
-    }
+    // Keep the Nix queries sequential: concurrent evaluation can contend for
+    // Nix's evaluation cache on a single machine.
+    let source = nix::resolve_source(&package.repository).await?;
+    let derivation_path = nix::derivation_path(&package).await?;
+    nix::build(&package, quiet).await?;
+    let output = nix::output_info(&package).await?;
 
-    let path_info = nix::get_path_info(&package).await?;
-
-    let evidence = evidences
-        .into_iter()
-        .next()
-        .unwrap_or(Evidences::Logs(None));
-    let _claim_name = evidence.claim();
-
-    let output = Output {
+    Ok(BuildEvidence {
+        schema_version: EVIDENCE_SCHEMA_VERSION,
+        builder_id,
         package,
-        evidences: evidence.clone(),
-        nar_hash: path_info.nar_hash,
-    };
-
-    Ok(CalcClaim::new(evidence, output).into_output())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_nonexistent_package_returns_error() {
-        let pkg = Package {
-            repository: "nixpkgs".to_string(),
-            name: "this-package-should-not-exist-ever-99999".to_string(),
-        };
-        let result = generate_evidence(pkg, vec![Evidences::Logs(None)], false, true).await;
-        assert!(
-            result.is_err(),
-            "generate_evidence should return Err for nonexistent package"
-        );
-    }
+        source,
+        derivation_path,
+        output_path: output.output_path,
+        nar_hash: output.nar_hash,
+        built_at: Utc::now(),
+    })
 }
