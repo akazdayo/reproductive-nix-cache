@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use reqwest::Client;
-use shared::{BuildEvidence, EvidenceList, EvidenceReceipt};
+use shared::{Evidence, EvidenceList, EvidenceReceipt};
 
 pub struct RegistryClient {
     base_url: String,
@@ -21,7 +21,7 @@ impl RegistryClient {
         })
     }
 
-    pub async fn submit(&self, evidence: &BuildEvidence) -> Result<EvidenceReceipt> {
+    pub async fn submit(&self, evidence: &Evidence) -> Result<EvidenceReceipt> {
         self.client
             .post(self.endpoint("/v1/evidence")?)
             .json(evidence)

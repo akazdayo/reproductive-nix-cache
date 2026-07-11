@@ -6,7 +6,7 @@ mod utils;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
-use shared::{BuildEvidence, EvidenceList, EvidenceReceipt};
+use shared::{Evidence, EvidenceList, EvidenceReceipt};
 
 #[derive(Parser)]
 #[command(name = "reproductive-nix-cache")]
@@ -35,7 +35,7 @@ enum Command {
 
 #[derive(Serialize)]
 struct BuildResult {
-    evidence: BuildEvidence,
+    evidence: Evidence,
     receipt: EvidenceReceipt,
     /// Uninterpreted evidence returned by the registry.
     facts: EvidenceList,
@@ -59,7 +59,12 @@ async fn main() -> Result<()> {
             let evidence = build::evidence::generate_evidence(package, builder_id, quiet).await?;
             let registry = client::RegistryClient::new(server)?;
             let receipt = registry.submit(&evidence).await?;
-            let facts = registry.facts(&evidence.derivation_path).await?;
+            let derivation_path = evidence
+                .build_claim()
+                .context("generated evidence has no build claim")?
+                .derivation_path
+                .clone();
+            let facts = registry.facts(&derivation_path).await?;
             let trust = trust::calculate_trust(&facts);
 
             println!(

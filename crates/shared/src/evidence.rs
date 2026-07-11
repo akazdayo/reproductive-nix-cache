@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-pub const EVIDENCE_SCHEMA_VERSION: u32 = 1;
+pub const EVIDENCE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Package {
@@ -23,15 +23,107 @@ pub struct ResolvedSource {
     pub nar_hash: Option<String>,
 }
 
-/// A claim made by a builder after it has rebuilt one Nix output locally.
-///
-/// This format deliberately contains no TEE attestation or signature. It is a
-/// transport format for the prototype, not a cryptographic proof.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BuildEvidence {
+pub struct Evidence {
     pub schema_version: u32,
     pub builder_id: String,
     pub package: Package,
+    pub claims: Vec<Claim>,
+}
+
+impl Evidence {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != EVIDENCE_SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported evidence schema version {}; expected {}",
+                self.schema_version, EVIDENCE_SCHEMA_VERSION
+            ));
+        }
+
+        validate_text("builder_id", &self.builder_id, 128)?;
+        validate_text("package.repository", &self.package.repository, 2048)?;
+        validate_text("package.name", &self.package.name, 1024)?;
+
+        let build_count = self
+            .claims
+            .iter()
+            .filter(|claim| matches!(claim, Claim::Build(_)))
+            .count();
+        if build_count != 1 {
+            return Err(format!(
+                "evidence must contain exactly one build claim; found {build_count}"
+            ));
+        }
+
+        for claim in &self.claims {
+            match claim {
+                Claim::Build(build) => {
+                    validate_text(
+                        "build.source.resolved_url",
+                        &build.source.resolved_url,
+                        4096,
+                    )?;
+                    validate_optional_text(
+                        "build.source.revision",
+                        build.source.revision.as_deref(),
+                        1024,
+                    )?;
+                    validate_optional_text(
+                        "build.source.nar_hash",
+                        build.source.nar_hash.as_deref(),
+                        1024,
+                    )?;
+                    validate_text("build.derivation_path", &build.derivation_path, 4096)?;
+                    validate_text("build.output_path", &build.output_path, 4096)?;
+                    validate_text("build.nar_hash", &build.nar_hash, 1024)?;
+                }
+                Claim::Log(log) => {
+                    if log.finished_at < log.started_at {
+                        return Err(
+                            "log.finished_at must not be earlier than log.started_at".into()
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn build_claim(&self) -> Option<&BuildClaim> {
+        self.claims.iter().find_map(|claim| match claim {
+            Claim::Build(build) => Some(build),
+            Claim::Log(_) => None,
+        })
+    }
+}
+
+fn validate_text(name: &str, value: &str, max_len: usize) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!("{name} must not be empty"));
+    }
+    if value.len() > max_len {
+        return Err(format!("{name} exceeds the maximum length of {max_len}"));
+    }
+    Ok(())
+}
+
+fn validate_optional_text(name: &str, value: Option<&str>, max_len: usize) -> Result<(), String> {
+    if let Some(value) = value {
+        validate_text(name, value, max_len)?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
+pub enum Claim {
+    Build(BuildClaim),
+    Log(LogClaim),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildClaim {
     pub source: ResolvedSource,
     pub derivation_path: String,
     pub output_path: String,
@@ -40,10 +132,18 @@ pub struct BuildEvidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogClaim {
+    pub stdout: String,
+    pub stderr: String,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredEvidence {
     pub id: i64,
     #[serde(flatten)]
-    pub evidence: BuildEvidence,
+    pub evidence: Evidence,
     pub received_at: DateTime<Utc>,
 }
 
@@ -64,6 +164,39 @@ pub struct EvidenceReceipt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+
+    fn claim_evidence() -> Evidence {
+        let started_at = Utc.with_ymd_and_hms(2026, 7, 11, 0, 0, 0).unwrap();
+        let finished_at = Utc.with_ymd_and_hms(2026, 7, 11, 0, 1, 0).unwrap();
+        Evidence {
+            schema_version: EVIDENCE_SCHEMA_VERSION,
+            builder_id: "builder-a".into(),
+            package: Package {
+                repository: "nixpkgs".into(),
+                name: "hello".into(),
+            },
+            claims: vec![
+                Claim::Build(BuildClaim {
+                    source: ResolvedSource {
+                        resolved_url: "flake:nixpkgs".into(),
+                        revision: Some("revision".into()),
+                        nar_hash: Some("sha256-source".into()),
+                    },
+                    derivation_path: "/nix/store/hello.drv".into(),
+                    output_path: "/nix/store/hello".into(),
+                    nar_hash: "sha256-output".into(),
+                    built_at: finished_at,
+                }),
+                Claim::Log(LogClaim {
+                    stdout: "stdout\n".into(),
+                    stderr: "stderr\n".into(),
+                    started_at,
+                    finished_at,
+                }),
+            ],
+        }
+    }
 
     #[test]
     fn package_reference_joins_repository_and_attribute() {
@@ -73,5 +206,78 @@ mod tests {
         };
 
         assert_eq!(package.reference(), "nixpkgs#hello");
+    }
+
+    #[test]
+    fn claims_use_tagged_json_and_round_trip() {
+        let evidence = claim_evidence();
+        let value = serde_json::to_value(&evidence).unwrap();
+        assert_eq!(value["claims"][0]["type"], "build");
+        assert_eq!(
+            value["claims"][0]["payload"]["derivation_path"],
+            "/nix/store/hello.drv"
+        );
+        assert_eq!(value["claims"][1]["type"], "log");
+        assert_eq!(value["claims"][1]["payload"]["stderr"], "stderr\n");
+
+        let decoded: Evidence = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, evidence);
+    }
+
+    #[test]
+    fn validation_requires_exactly_one_build_claim() {
+        let mut evidence = claim_evidence();
+        evidence
+            .claims
+            .retain(|claim| !matches!(claim, Claim::Build(_)));
+        assert_eq!(
+            evidence.validate().unwrap_err(),
+            "evidence must contain exactly one build claim; found 0"
+        );
+
+        let build = claim_evidence().claims.remove(0);
+        evidence.claims.push(build.clone());
+        evidence.claims.push(build);
+        assert_eq!(
+            evidence.validate().unwrap_err(),
+            "evidence must contain exactly one build claim; found 2"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_empty_fields_and_reversed_log_time() {
+        let mut evidence = claim_evidence();
+        evidence.builder_id.clear();
+        assert_eq!(
+            evidence.validate().unwrap_err(),
+            "builder_id must not be empty"
+        );
+
+        let mut evidence = claim_evidence();
+        let Claim::Build(build) = &mut evidence.claims[0] else {
+            unreachable!()
+        };
+        build.nar_hash.clear();
+        assert_eq!(
+            evidence.validate().unwrap_err(),
+            "build.nar_hash must not be empty"
+        );
+
+        let mut evidence = claim_evidence();
+        let Claim::Log(log) = &mut evidence.claims[1] else {
+            unreachable!()
+        };
+        std::mem::swap(&mut log.started_at, &mut log.finished_at);
+        assert_eq!(
+            evidence.validate().unwrap_err(),
+            "log.finished_at must not be earlier than log.started_at"
+        );
+    }
+
+    #[test]
+    fn validation_allows_multiple_log_claims() {
+        let mut evidence = claim_evidence();
+        evidence.claims.push(evidence.claims[1].clone());
+        assert!(evidence.validate().is_ok());
     }
 }

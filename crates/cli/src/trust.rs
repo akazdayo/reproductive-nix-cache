@@ -36,9 +36,12 @@ pub fn calculate_trust(facts: &EvidenceList) -> TrustScore {
     let mut variants: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut all_builders = BTreeSet::new();
     for stored in &facts.evidences {
+        let Some(build) = stored.evidence.build_claim() else {
+            continue;
+        };
         all_builders.insert(stored.evidence.builder_id.clone());
         variants
-            .entry(stored.evidence.nar_hash.clone())
+            .entry(build.nar_hash.clone())
             .or_default()
             .insert(stored.evidence.builder_id.clone());
     }
@@ -105,7 +108,10 @@ fn rounded_score(matching_builders: usize, total_builders: usize) -> u8 {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use shared::{BuildEvidence, EVIDENCE_SCHEMA_VERSION, Package, ResolvedSource, StoredEvidence};
+    use shared::{
+        BuildClaim, Claim, EVIDENCE_SCHEMA_VERSION, Evidence, Package, ResolvedSource,
+        StoredEvidence,
+    };
 
     fn facts(reports: &[(&str, &str)]) -> EvidenceList {
         EvidenceList {
@@ -115,22 +121,24 @@ mod tests {
                 .enumerate()
                 .map(|(index, (builder_id, nar_hash))| StoredEvidence {
                     id: index as i64,
-                    evidence: BuildEvidence {
+                    evidence: Evidence {
                         schema_version: EVIDENCE_SCHEMA_VERSION,
                         builder_id: (*builder_id).into(),
                         package: Package {
                             repository: "nixpkgs".into(),
                             name: "hello".into(),
                         },
-                        source: ResolvedSource {
-                            resolved_url: "flake:nixpkgs".into(),
-                            revision: None,
-                            nar_hash: None,
-                        },
-                        derivation_path: "/nix/store/example.drv".into(),
-                        output_path: "/nix/store/example".into(),
-                        nar_hash: (*nar_hash).into(),
-                        built_at: Utc::now(),
+                        claims: vec![Claim::Build(BuildClaim {
+                            source: ResolvedSource {
+                                resolved_url: "flake:nixpkgs".into(),
+                                revision: None,
+                                nar_hash: None,
+                            },
+                            derivation_path: "/nix/store/example.drv".into(),
+                            output_path: "/nix/store/example".into(),
+                            nar_hash: (*nar_hash).into(),
+                            built_at: Utc::now(),
+                        })],
                     },
                     received_at: Utc::now(),
                 })

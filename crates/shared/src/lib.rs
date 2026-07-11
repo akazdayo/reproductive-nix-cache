@@ -1,6 +1,6 @@
 pub mod evidence;
 
 pub use evidence::{
-    BuildEvidence, EVIDENCE_SCHEMA_VERSION, EvidenceList, EvidenceReceipt, Package, ResolvedSource,
-    StoredEvidence,
+    BuildClaim, Claim, EVIDENCE_SCHEMA_VERSION, Evidence, EvidenceList, EvidenceReceipt, LogClaim,
+    Package, ResolvedSource, StoredEvidence,
 };
