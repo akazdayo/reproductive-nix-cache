@@ -1,9 +1,11 @@
 mod build;
+mod claims;
 mod client;
 mod trust;
 mod utils;
 
 use anyhow::{Context, Result};
+use claims::ClaimKind;
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 use shared::{Evidence, EvidenceList, EvidenceReceipt};
@@ -30,6 +32,9 @@ enum Command {
         /// Suppress Nix build output
         #[arg(long)]
         quiet: bool,
+        /// Additional claim to include; the build claim is always included
+        #[arg(long = "claim", value_enum)]
+        claims: Vec<ClaimKind>,
     },
 }
 
@@ -52,11 +57,15 @@ async fn main() -> Result<()> {
             builder_id,
             server,
             quiet,
+            claims,
         } => {
             let package = utils::parse_nix_repository(&package_ref).with_context(|| {
                 "package reference must have the form <flake>#<attribute>, for example nixpkgs#hello"
             })?;
-            let evidence = build::evidence::generate_evidence(package, builder_id, quiet).await?;
+            let enabled_claims = ClaimKind::with_required_build(claims);
+            let evidence =
+                build::evidence::generate_evidence(package, builder_id, quiet, enabled_claims)
+                    .await?;
             let registry = client::RegistryClient::new(server)?;
             let receipt = registry.submit(&evidence).await?;
             let derivation_path = evidence
@@ -79,4 +88,54 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_defaults_to_required_build_claim_only() {
+        let cli = Cli::try_parse_from([
+            "reproductive-nix-cache",
+            "build",
+            "nixpkgs#hello",
+            "--builder-id",
+            "builder-a",
+            "--server",
+            "http://127.0.0.1:3000",
+        ])
+        .unwrap();
+        let Command::Build { claims, .. } = cli.command;
+        assert!(claims.is_empty());
+        assert_eq!(
+            crate::claims::ClaimKind::with_required_build(claims),
+            vec![crate::claims::ClaimKind::Build]
+        );
+    }
+
+    #[test]
+    fn build_accepts_log_as_an_optional_claim() {
+        let cli = Cli::try_parse_from([
+            "reproductive-nix-cache",
+            "build",
+            "nixpkgs#hello",
+            "--builder-id",
+            "builder-a",
+            "--server",
+            "http://127.0.0.1:3000",
+            "--claim",
+            "log",
+        ])
+        .unwrap();
+        let Command::Build { claims, .. } = cli.command;
+        assert_eq!(claims, vec![crate::claims::ClaimKind::Log]);
+        assert_eq!(
+            crate::claims::ClaimKind::with_required_build(claims),
+            vec![
+                crate::claims::ClaimKind::Build,
+                crate::claims::ClaimKind::Log
+            ]
+        );
+    }
 }
