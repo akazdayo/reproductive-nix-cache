@@ -7,6 +7,7 @@ mod utils;
 use anyhow::{Context, Result};
 use claims::ClaimKind;
 use clap::{Parser, Subcommand};
+use client::Host;
 use serde::Serialize;
 use shared::{Evidence, EvidenceList, EvidenceReceipt};
 
@@ -26,9 +27,9 @@ enum Command {
         /// Stable identifier for this independent builder
         #[arg(long)]
         builder_id: String,
-        /// Base URL of the evidence registry, for example http://127.0.0.1:3000
+        /// Host of the evidence registry, for example 127.0.0.1:3000 or example.com
         #[arg(long)]
-        server: String,
+        server: Host,
         /// Suppress Nix build output
         #[arg(long)]
         quiet: bool,
@@ -66,7 +67,7 @@ async fn main() -> Result<()> {
             let evidence =
                 build::evidence::generate_evidence(package, builder_id, quiet, enabled_claims)
                     .await?;
-            let registry = client::RegistryClient::new(server)?;
+            let registry = client::RegistryClient::new(&server)?;
             let receipt = registry.submit(&evidence).await?;
             let derivation_path = evidence
                 .build_claim()
@@ -103,7 +104,7 @@ mod tests {
             "--builder-id",
             "builder-a",
             "--server",
-            "http://127.0.0.1:3000",
+            "127.0.0.1:3000",
         ])
         .unwrap();
         let Command::Build { claims, .. } = cli.command;
@@ -123,7 +124,7 @@ mod tests {
             "--builder-id",
             "builder-a",
             "--server",
-            "http://127.0.0.1:3000",
+            "127.0.0.1:3000",
             "--claim",
             "log",
         ])
