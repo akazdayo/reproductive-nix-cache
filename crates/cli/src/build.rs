@@ -1,3 +1,2 @@
 pub mod evidence;
-pub mod model;
-mod nix;
+pub mod nix;

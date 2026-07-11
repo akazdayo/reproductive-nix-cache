@@ -1,59 +1,32 @@
-mod logs;
+use clap::ValueEnum;
 
-pub trait EvidenceClaim {
-    fn claim(&self) -> &'static str;
-    fn into_claimed(self) -> Self;
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ClaimKind {
+    Build,
+    Log,
 }
 
-pub struct CalcClaim {
-    evidence: shared::Evidences,
-    output: shared::Output,
-}
-
-impl CalcClaim {
-    pub fn new(evidence: shared::Evidences, output: shared::Output) -> Self {
-        Self { evidence, output }
-    }
-
-    pub fn into_output(mut self) -> shared::Output {
-        self.output.evidences = self.evidence.into_claimed();
-        self.output
-    }
-}
-
-impl EvidenceClaim for shared::Evidences {
-    fn claim(&self) -> &'static str {
-        match self {
-            shared::Evidences::Logs(_) => "logs",
-            shared::Evidences::IP(_) => "ip",
-        }
-    }
-
-    fn into_claimed(self) -> Self {
-        match self {
-            shared::Evidences::Logs(None) => {
-                shared::Evidences::Logs(Some(shared::LogsClaim::new("logs")))
+impl ClaimKind {
+    pub fn with_required_build(requested: Vec<Self>) -> Vec<Self> {
+        let mut enabled = vec![Self::Build];
+        for kind in requested {
+            if !enabled.contains(&kind) {
+                enabled.push(kind);
             }
-            shared::Evidences::IP(None) => shared::Evidences::IP(Some(Default::default())),
-            evidence => evidence,
         }
+        enabled
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::EvidenceClaim;
+    use super::*;
 
     #[test]
-    fn logs_evidence_has_claim() {
-        assert_eq!(shared::Evidences::Logs(None).claim(), "logs");
-    }
-
-    #[test]
-    fn logs_evidence_is_claimed() {
-        assert!(matches!(
-            shared::Evidences::Logs(None).into_claimed(),
-            shared::Evidences::Logs(Some(_))
-        ));
+    fn required_build_is_first_and_requested_claims_are_deduplicated() {
+        assert_eq!(
+            ClaimKind::with_required_build(vec![ClaimKind::Log, ClaimKind::Build, ClaimKind::Log,]),
+            vec![ClaimKind::Build, ClaimKind::Log]
+        );
     }
 }
