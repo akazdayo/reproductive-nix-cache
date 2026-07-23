@@ -90,8 +90,16 @@ pub mod build_claim {
         pub source_revision: Option<String>,
         pub source_nar_hash: Option<String>,
         pub derivation_path: String,
-        pub output_path: String,
+        pub output_name: String,
+        pub output_store_path: String,
         pub nar_hash: String,
+        pub nar_size: i64,
+        pub references_json: String,
+        pub closure_root: String,
+        pub content_addressed: Option<String>,
+        pub build_log_digest: Option<String>,
+        pub sbom_digest: Option<String>,
+        pub test_result_digest: Option<String>,
         pub built_at: DateTimeUtc,
     }
 

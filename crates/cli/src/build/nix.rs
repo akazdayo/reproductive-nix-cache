@@ -8,8 +8,12 @@ use tokio::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputInfo {
+    pub output_name: String,
     pub output_path: String,
     pub nar_hash: String,
+    pub nar_size: u64,
+    pub references: Vec<String>,
+    pub content_addressed: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +28,9 @@ pub struct BuildRun {
 #[serde(rename_all = "camelCase")]
 struct NixPathInfo {
     nar_hash: String,
+    nar_size: u64,
+    references: Vec<String>,
+    ca: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -145,6 +152,8 @@ where
 
 pub async fn output_info(package: &Package) -> Result<OutputInfo> {
     let reference = package.reference();
+    let output_attribute = format!("{reference}.outputName");
+    let output_name = run_text(["eval", "--raw", output_attribute.as_str()]).await?;
     let entries: BTreeMap<String, NixPathInfo> = run_json([
         "path-info",
         "--json-format",
@@ -156,9 +165,39 @@ pub async fn output_info(package: &Package) -> Result<OutputInfo> {
     let (output_path, info) = take_only_entry_with_value(entries, "nix path-info")?;
 
     Ok(OutputInfo {
+        output_name,
         output_path,
         nar_hash: info.nar_hash,
+        nar_size: info.nar_size,
+        references: info.references,
+        content_addressed: info.ca,
     })
+}
+
+async fn run_text<I, S>(args: I) -> Result<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let output = Command::new("nix")
+        .args(args)
+        .output()
+        .await
+        .context("failed to start nix")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "nix command failed with exit status {}: {stderr}",
+            output.status
+        );
+    }
+
+    let value = String::from_utf8(output.stdout).context("nix returned non-UTF-8 text")?;
+    let value = value.trim().to_owned();
+    if value.is_empty() {
+        bail!("nix returned empty text");
+    }
+    Ok(value)
 }
 
 async fn run_json<T, I, S>(args: I) -> Result<T>
@@ -208,6 +247,27 @@ fn take_only_entry_with_value<T>(
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn path_info_deserializes_build_statement_fields() {
+        let entries: BTreeMap<String, NixPathInfo> = serde_json::from_str(
+            r#"{
+                "/nix/store/example": {
+                    "narHash": "sha256-output",
+                    "narSize": 1234,
+                    "references": ["/nix/store/glibc"],
+                    "ca": "fixed:r:sha256:example"
+                }
+            }"#,
+        )
+        .unwrap();
+        let (_, info) = take_only_entry_with_value(entries, "nix path-info").unwrap();
+
+        assert_eq!(info.nar_hash, "sha256-output");
+        assert_eq!(info.nar_size, 1234);
+        assert_eq!(info.references, vec!["/nix/store/glibc"]);
+        assert_eq!(info.ca.as_deref(), Some("fixed:r:sha256:example"));
+    }
 
     #[test]
     fn only_entry_rejects_multiple_nix_results() {

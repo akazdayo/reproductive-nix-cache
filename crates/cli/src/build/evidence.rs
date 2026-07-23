@@ -1,8 +1,12 @@
 use crate::build::nix;
 use crate::claims::ClaimKind;
 use anyhow::{Result, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use shared::{
-    BuildClaim, Claim, EVIDENCE_SCHEMA_VERSION, Evidence, LogClaim, Package, ResolvedSource,
+    BuildClaim, BuildStatement, Claim, EVIDENCE_SCHEMA_VERSION, Evidence, LogClaim, Package,
+    ResolvedSource,
 };
 
 /// Rebuild an output without substitutes, then collect the facts needed to
@@ -44,25 +48,39 @@ fn compose_evidence(
     run: nix::BuildRun,
     enabled_claims: Vec<ClaimKind>,
 ) -> Evidence {
-    let build = BuildClaim {
-        source,
-        derivation_path,
-        output_path: output.output_path,
-        nar_hash: output.nar_hash,
-        built_at: run.finished_at,
-    };
     let log = LogClaim {
         stdout: run.stdout,
         stderr: run.stderr,
         started_at: run.started_at,
         finished_at: run.finished_at,
     };
+    let build_log_digest = Some(digest_build_log(&log));
+    let closure_root = output.output_path.clone();
+    let build = BuildClaim {
+        source,
+        derivation_path,
+        build_statement: BuildStatement {
+            output_name: output.output_name,
+            output_store_path: output.output_path,
+            nar_hash: output.nar_hash,
+            nar_size: output.nar_size,
+            references: output.references,
+            closure_root,
+            content_addressed: output.content_addressed,
+            build_log_digest,
+            sbom_digest: None,
+            test_result_digest: None,
+        },
+        built_at: run.finished_at,
+    };
     let mut build = Some(build);
     let mut log = Some(log);
     let claims = enabled_claims
         .into_iter()
         .map(|kind| match kind {
-            ClaimKind::Build => Claim::Build(build.take().expect("build claim was deduplicated")),
+            ClaimKind::Build => Claim::Build(Box::new(
+                build.take().expect("build claim was deduplicated"),
+            )),
             ClaimKind::Log => Claim::Log(log.take().expect("log claim was deduplicated")),
         })
         .collect();
@@ -73,6 +91,25 @@ fn compose_evidence(
         package,
         claims,
     }
+}
+
+/// Hash the compact JSON object `{ "stdout": ..., "stderr": ... }` and use
+/// the same SRI representation as Nix hashes.
+/// 要はLogClaimと違って、ハッシュだけ送るということ
+fn digest_build_log(log: &LogClaim) -> String {
+    #[derive(Serialize)]
+    struct BuildLog<'a> {
+        stdout: &'a str,
+        stderr: &'a str,
+    }
+
+    let bytes = serde_json::to_vec(&BuildLog {
+        stdout: &log.stdout,
+        stderr: &log.stderr,
+    })
+    .expect("serializing build log strings cannot fail");
+    let hash = Sha256::digest(bytes);
+    format!("sha256-{}", STANDARD.encode(hash))
 }
 
 #[cfg(test)]
@@ -98,8 +135,12 @@ mod tests {
             },
             "/nix/store/hello.drv".into(),
             nix::OutputInfo {
+                output_name: "out".into(),
                 output_path: "/nix/store/hello".into(),
                 nar_hash: "sha256-output".into(),
+                nar_size: 1234,
+                references: vec!["/nix/store/glibc".into()],
+                content_addressed: None,
             },
             nix::BuildRun {
                 stdout: "stdout\n".into(),
@@ -111,7 +152,20 @@ mod tests {
         );
 
         assert_eq!(evidence.claims.len(), 1);
-        assert!(matches!(evidence.claims[0], Claim::Build(_)));
+        let Claim::Build(build) = &evidence.claims[0] else {
+            panic!("expected build claim")
+        };
+        assert_eq!(build.build_statement.output_name, "out");
+        assert_eq!(build.build_statement.nar_size, 1234);
+        assert_eq!(build.build_statement.references, vec!["/nix/store/glibc"]);
+        assert_eq!(build.build_statement.closure_root, "/nix/store/hello");
+        assert!(
+            build
+                .build_statement
+                .build_log_digest
+                .as_deref()
+                .is_some_and(|digest| digest.starts_with("sha256-"))
+        );
     }
 
     #[test]
@@ -131,8 +185,12 @@ mod tests {
             },
             "/nix/store/hello.drv".into(),
             nix::OutputInfo {
+                output_name: "out".into(),
                 output_path: "/nix/store/hello".into(),
                 nar_hash: "sha256-output".into(),
+                nar_size: 1234,
+                references: vec!["/nix/store/glibc".into()],
+                content_addressed: Some("fixed:r:sha256:example".into()),
             },
             nix::BuildRun {
                 stdout: "stdout\n".into(),
@@ -145,6 +203,20 @@ mod tests {
 
         assert!(matches!(evidence.claims[0], Claim::Build(_)));
         assert!(matches!(evidence.claims[1], Claim::Log(_)));
+        let Claim::Build(build) = &evidence.claims[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            build.build_statement.content_addressed.as_deref(),
+            Some("fixed:r:sha256:example")
+        );
+        assert!(
+            build
+                .build_statement
+                .build_log_digest
+                .as_deref()
+                .is_some_and(|digest| digest.starts_with("sha256-"))
+        );
         let Claim::Log(log) = &evidence.claims[1] else {
             unreachable!()
         };

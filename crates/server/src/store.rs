@@ -7,8 +7,8 @@ use sea_orm::{
     TransactionTrait, sea_query::Index,
 };
 use shared::{
-    BuildClaim, Claim, Evidence, EvidenceList, EvidenceReceipt, LogClaim, Package, ResolvedSource,
-    StoredEvidence,
+    BuildClaim, BuildStatement, Claim, Evidence, EvidenceList, EvidenceReceipt, LogClaim, Package,
+    ResolvedSource, StoredEvidence,
 };
 use std::path::Path;
 
@@ -77,6 +77,22 @@ impl EvidenceStore {
         if legacy.is_some() {
             bail!(
                 "legacy evidence schema detected; delete the SQLite database and restart the server"
+            );
+        }
+
+        let old_build_claims = self
+            .database
+            .query_one(Statement::from_string(
+                backend,
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'build_claims' \
+                 AND NOT EXISTS (SELECT 1 FROM pragma_table_info('build_claims') WHERE name = \
+                 'output_name')",
+            ))
+            .await
+            .context("failed to inspect build statement schema")?;
+        if old_build_claims.is_some() {
+            bail!(
+                "evidence schema version 2 detected; delete the SQLite database and restart the server"
             );
         }
 
@@ -161,8 +177,20 @@ impl EvidenceStore {
                         source_revision: Set(build.source.revision.clone()),
                         source_nar_hash: Set(build.source.nar_hash.clone()),
                         derivation_path: Set(build.derivation_path.clone()),
-                        output_path: Set(build.output_path.clone()),
-                        nar_hash: Set(build.nar_hash.clone()),
+                        output_name: Set(build.build_statement.output_name.clone()),
+                        output_store_path: Set(build.build_statement.output_store_path.clone()),
+                        nar_hash: Set(build.build_statement.nar_hash.clone()),
+                        nar_size: Set(i64::try_from(build.build_statement.nar_size)
+                            .context("NAR size exceeds SQLite's signed integer range")?),
+                        references_json: Set(serde_json::to_string(
+                            &build.build_statement.references,
+                        )
+                        .context("failed to serialize build references")?),
+                        closure_root: Set(build.build_statement.closure_root.clone()),
+                        content_addressed: Set(build.build_statement.content_addressed.clone()),
+                        build_log_digest: Set(build.build_statement.build_log_digest.clone()),
+                        sbom_digest: Set(build.build_statement.sbom_digest.clone()),
+                        test_result_digest: Set(build.build_statement.test_result_digest.clone()),
                         built_at: Set(build.built_at),
                     })
                     .exec(&transaction)
@@ -256,17 +284,29 @@ impl EvidenceStore {
                         .one(&self.database)
                         .await?
                         .context("build claim payload is missing")?;
-                    Claim::Build(BuildClaim {
+                    Claim::Build(Box::new(BuildClaim {
                         source: ResolvedSource {
                             resolved_url: model.source_resolved_url,
                             revision: model.source_revision,
                             nar_hash: model.source_nar_hash,
                         },
                         derivation_path: model.derivation_path,
-                        output_path: model.output_path,
-                        nar_hash: model.nar_hash,
+                        build_statement: BuildStatement {
+                            output_name: model.output_name,
+                            output_store_path: model.output_store_path,
+                            nar_hash: model.nar_hash,
+                            nar_size: u64::try_from(model.nar_size)
+                                .context("stored NAR size is negative")?,
+                            references: serde_json::from_str(&model.references_json)
+                                .context("stored build references are invalid")?,
+                            closure_root: model.closure_root,
+                            content_addressed: model.content_addressed,
+                            build_log_digest: model.build_log_digest,
+                            sbom_digest: model.sbom_digest,
+                            test_result_digest: model.test_result_digest,
+                        },
                         built_at: model.built_at,
-                    })
+                    }))
                 }
                 LOG_KIND => {
                     let model = log_claim::Entity::find_by_id(row.id)
@@ -329,17 +369,27 @@ mod tests {
                     started_at,
                     finished_at,
                 }),
-                Claim::Build(BuildClaim {
+                Claim::Build(Box::new(BuildClaim {
                     source: ResolvedSource {
                         resolved_url: "flake:nixpkgs".into(),
                         revision: None,
                         nar_hash: Some("sha256-source".into()),
                     },
                     derivation_path: "/nix/store/hello.drv".into(),
-                    output_path: "/nix/store/hello".into(),
-                    nar_hash: nar_hash.into(),
+                    build_statement: BuildStatement {
+                        output_name: "out".into(),
+                        output_store_path: "/nix/store/hello".into(),
+                        nar_hash: nar_hash.into(),
+                        nar_size: 1234,
+                        references: vec!["/nix/store/glibc".into()],
+                        closure_root: "/nix/store/hello".into(),
+                        content_addressed: Some("fixed:r:sha256:example".into()),
+                        build_log_digest: None,
+                        sbom_digest: None,
+                        test_result_digest: None,
+                    },
                     built_at: finished_at,
-                }),
+                })),
             ],
         }
     }
@@ -366,6 +416,21 @@ mod tests {
 
         let list = store.list("/nix/store/hello.drv").await.unwrap();
         assert_eq!(list.evidences.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn initialization_rejects_schema_without_build_statements() {
+        let database = Database::connect("sqlite::memory:").await.unwrap();
+        database
+            .execute_unprepared(
+                "CREATE TABLE build_claims (claim_id INTEGER PRIMARY KEY, output_path TEXT NOT NULL)",
+            )
+            .await
+            .unwrap();
+        let store = EvidenceStore { database };
+
+        let error = store.initialise().await.unwrap_err();
+        assert!(error.to_string().contains("schema version 2 detected"));
     }
 
     #[tokio::test]

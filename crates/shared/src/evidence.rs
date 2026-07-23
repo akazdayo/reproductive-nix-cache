@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-pub const EVIDENCE_SCHEMA_VERSION: u32 = 2;
+pub const EVIDENCE_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Package {
@@ -74,8 +74,49 @@ impl Evidence {
                         1024,
                     )?;
                     validate_text("build.derivation_path", &build.derivation_path, 4096)?;
-                    validate_text("build.output_path", &build.output_path, 4096)?;
-                    validate_text("build.nar_hash", &build.nar_hash, 1024)?;
+                    validate_text(
+                        "build.build_statement.output_name",
+                        &build.build_statement.output_name,
+                        1024,
+                    )?;
+                    validate_text(
+                        "build.build_statement.output_store_path",
+                        &build.build_statement.output_store_path,
+                        4096,
+                    )?;
+                    validate_text(
+                        "build.build_statement.nar_hash",
+                        &build.build_statement.nar_hash,
+                        1024,
+                    )?;
+                    for reference in &build.build_statement.references {
+                        validate_text("build.build_statement.references[]", reference, 4096)?;
+                    }
+                    validate_text(
+                        "build.build_statement.closure_root",
+                        &build.build_statement.closure_root,
+                        4096,
+                    )?;
+                    validate_optional_text(
+                        "build.build_statement.content_addressed",
+                        build.build_statement.content_addressed.as_deref(),
+                        1024,
+                    )?;
+                    validate_optional_text(
+                        "build.build_statement.build_log_digest",
+                        build.build_statement.build_log_digest.as_deref(),
+                        1024,
+                    )?;
+                    validate_optional_text(
+                        "build.build_statement.sbom_digest",
+                        build.build_statement.sbom_digest.as_deref(),
+                        1024,
+                    )?;
+                    validate_optional_text(
+                        "build.build_statement.test_result_digest",
+                        build.build_statement.test_result_digest.as_deref(),
+                        1024,
+                    )?;
                 }
                 Claim::Log(log) => {
                     if log.finished_at < log.started_at {
@@ -92,13 +133,14 @@ impl Evidence {
 
     pub fn build_claim(&self) -> Option<&BuildClaim> {
         self.claims.iter().find_map(|claim| match claim {
-            Claim::Build(build) => Some(build),
+            Claim::Build(build) => Some(build.as_ref()),
             Claim::Log(_) => None,
         })
     }
 }
 
 fn validate_text(name: &str, value: &str, max_len: usize) -> Result<(), String> {
+    // nameはエラー吐く用かな
     if value.trim().is_empty() {
         return Err(format!("{name} must not be empty"));
     }
@@ -118,7 +160,7 @@ fn validate_optional_text(name: &str, value: Option<&str>, max_len: usize) -> Re
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum Claim {
-    Build(BuildClaim),
+    Build(Box<BuildClaim>),
     Log(LogClaim),
 }
 
@@ -126,9 +168,29 @@ pub enum Claim {
 pub struct BuildClaim {
     pub source: ResolvedSource,
     pub derivation_path: String,
-    pub output_path: String,
-    pub nar_hash: String,
+    pub build_statement: BuildStatement,
     pub built_at: DateTime<Utc>,
+}
+
+/// Facts that identify one concrete output produced by a Nix build.
+///
+/// This is the innermost layer of the attestation model. Execution evidence,
+/// attestation results, and collective records can wrap it without flattening
+/// output facts into their own envelopes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildStatement {
+    pub output_name: String,
+    pub output_store_path: String,
+    pub nar_hash: String,
+    pub nar_size: u64,
+    pub references: Vec<String>,
+    pub closure_root: String,
+    /// Nix's content address (`ca` in `nix path-info --json`), when present.
+    pub content_addressed: Option<String>,
+    /// Digests are optional until the corresponding artifact is collected.
+    pub build_log_digest: Option<String>,
+    pub sbom_digest: Option<String>,
+    pub test_result_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,17 +239,27 @@ mod tests {
                 name: "hello".into(),
             },
             claims: vec![
-                Claim::Build(BuildClaim {
+                Claim::Build(Box::new(BuildClaim {
                     source: ResolvedSource {
                         resolved_url: "flake:nixpkgs".into(),
                         revision: Some("revision".into()),
                         nar_hash: Some("sha256-source".into()),
                     },
                     derivation_path: "/nix/store/hello.drv".into(),
-                    output_path: "/nix/store/hello".into(),
-                    nar_hash: "sha256-output".into(),
+                    build_statement: BuildStatement {
+                        output_name: "out".into(),
+                        output_store_path: "/nix/store/hello".into(),
+                        nar_hash: "sha256-output".into(),
+                        nar_size: 1234,
+                        references: vec!["/nix/store/glibc".into()],
+                        closure_root: "/nix/store/hello".into(),
+                        content_addressed: None,
+                        build_log_digest: None,
+                        sbom_digest: None,
+                        test_result_digest: None,
+                    },
                     built_at: finished_at,
-                }),
+                })),
                 Claim::Log(LogClaim {
                     stdout: "stdout\n".into(),
                     stderr: "stderr\n".into(),
@@ -214,8 +286,8 @@ mod tests {
         let value = serde_json::to_value(&evidence).unwrap();
         assert_eq!(value["claims"][0]["type"], "build");
         assert_eq!(
-            value["claims"][0]["payload"]["derivation_path"],
-            "/nix/store/hello.drv"
+            value["claims"][0]["payload"]["build_statement"]["output_store_path"],
+            "/nix/store/hello"
         );
         assert_eq!(value["claims"][1]["type"], "log");
         assert_eq!(value["claims"][1]["payload"]["stderr"], "stderr\n");
@@ -257,10 +329,10 @@ mod tests {
         let Claim::Build(build) = &mut evidence.claims[0] else {
             unreachable!()
         };
-        build.nar_hash.clear();
+        build.build_statement.nar_hash.clear();
         assert_eq!(
             evidence.validate().unwrap_err(),
-            "build.nar_hash must not be empty"
+            "build.build_statement.nar_hash must not be empty"
         );
 
         let mut evidence = claim_evidence();

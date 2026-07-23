@@ -41,7 +41,7 @@ pub fn calculate_trust(facts: &EvidenceList) -> TrustScore {
         };
         all_builders.insert(stored.evidence.builder_id.clone());
         variants
-            .entry(build.nar_hash.clone())
+            .entry(build.build_statement.nar_hash.clone())
             .or_default()
             .insert(stored.evidence.builder_id.clone());
     }
@@ -109,8 +109,8 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use shared::{
-        BuildClaim, Claim, EVIDENCE_SCHEMA_VERSION, Evidence, Package, ResolvedSource,
-        StoredEvidence,
+        BuildClaim, BuildStatement, Claim, EVIDENCE_SCHEMA_VERSION, Evidence, Package,
+        ResolvedSource, StoredEvidence,
     };
 
     fn facts(reports: &[(&str, &str)]) -> EvidenceList {
@@ -128,17 +128,27 @@ mod tests {
                             repository: "nixpkgs".into(),
                             name: "hello".into(),
                         },
-                        claims: vec![Claim::Build(BuildClaim {
+                        claims: vec![Claim::Build(Box::new(BuildClaim {
                             source: ResolvedSource {
                                 resolved_url: "flake:nixpkgs".into(),
                                 revision: None,
                                 nar_hash: None,
                             },
                             derivation_path: "/nix/store/example.drv".into(),
-                            output_path: "/nix/store/example".into(),
-                            nar_hash: (*nar_hash).into(),
+                            build_statement: BuildStatement {
+                                output_name: "out".into(),
+                                output_store_path: "/nix/store/example".into(),
+                                nar_hash: (*nar_hash).into(),
+                                nar_size: 1234,
+                                references: vec![],
+                                closure_root: "/nix/store/example".into(),
+                                content_addressed: None,
+                                build_log_digest: None,
+                                sbom_digest: None,
+                                test_result_digest: None,
+                            },
                             built_at: Utc::now(),
-                        })],
+                        }))],
                     },
                     received_at: Utc::now(),
                 })

@@ -131,8 +131,8 @@ mod tests {
     };
     use chrono::{Duration, Utc};
     use shared::{
-        BuildClaim, Claim, EVIDENCE_SCHEMA_VERSION, Evidence, EvidenceReceipt, LogClaim, Package,
-        ResolvedSource,
+        BuildClaim, BuildStatement, Claim, EVIDENCE_SCHEMA_VERSION, Evidence, EvidenceReceipt,
+        LogClaim, Package, ResolvedSource,
     };
     use tower::ServiceExt;
 
@@ -147,17 +147,27 @@ mod tests {
                 name: "hello".into(),
             },
             claims: vec![
-                Claim::Build(BuildClaim {
+                Claim::Build(Box::new(BuildClaim {
                     source: ResolvedSource {
                         resolved_url: "flake:nixpkgs".into(),
                         revision: None,
                         nar_hash: Some("sha256-source".into()),
                     },
                     derivation_path: "/nix/store/example-hello.drv".into(),
-                    output_path: "/nix/store/example-hello".into(),
-                    nar_hash: nar_hash.into(),
+                    build_statement: BuildStatement {
+                        output_name: "out".into(),
+                        output_store_path: "/nix/store/example-hello".into(),
+                        nar_hash: nar_hash.into(),
+                        nar_size: 1234,
+                        references: vec!["/nix/store/glibc".into()],
+                        closure_root: "/nix/store/example-hello".into(),
+                        content_addressed: None,
+                        build_log_digest: None,
+                        sbom_digest: None,
+                        test_result_digest: None,
+                    },
                     built_at: finished_at,
-                }),
+                })),
                 Claim::Log(LogClaim {
                     stdout: "stdout\n".into(),
                     stderr: "stderr\n".into(),
@@ -221,7 +231,12 @@ mod tests {
         assert_eq!(facts.evidences.len(), 2);
         assert_eq!(facts.evidences[0].evidence.builder_id, "builder-a");
         assert_eq!(
-            facts.evidences[0].evidence.build_claim().unwrap().nar_hash,
+            facts.evidences[0]
+                .evidence
+                .build_claim()
+                .unwrap()
+                .build_statement
+                .nar_hash,
             "sha256-out"
         );
     }
