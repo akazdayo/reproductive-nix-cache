@@ -9,12 +9,13 @@ use shared::{
     ResolvedSource,
 };
 
-/// Rebuild an output without substitutes, then collect the facts needed to
-/// compare it with reports from other builders.
+/// Rebuild an output, optionally using substitutes, then collect the facts
+/// needed to compare it with reports from other builders.
 pub async fn generate_evidence(
     package: Package,
     builder_id: String,
     quiet: bool,
+    substitute: bool,
     enabled_claims: Vec<ClaimKind>,
 ) -> Result<Evidence> {
     if builder_id.trim().is_empty() {
@@ -25,7 +26,7 @@ pub async fn generate_evidence(
     // Nix's evaluation cache on a single machine.
     let source = nix::resolve_source(&package.repository).await?;
     let derivation_path = nix::derivation_path(&package).await?;
-    let run = nix::build(&package, quiet).await?;
+    let run = nix::build(&package, quiet, substitute).await?;
     let output = nix::output_info(&package).await?;
 
     Ok(compose_evidence(

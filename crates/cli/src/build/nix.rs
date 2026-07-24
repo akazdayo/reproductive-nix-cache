@@ -80,19 +80,11 @@ pub async fn derivation_path(package: &Package) -> Result<String> {
     take_only_entry(entries, "nix path-info --derivation")
 }
 
-pub async fn build(package: &Package, quiet: bool) -> Result<BuildRun> {
+pub async fn build(package: &Package, quiet: bool, substitute: bool) -> Result<BuildRun> {
     let reference = package.reference();
     let started_at = Utc::now();
     let mut child = Command::new("nix")
-        .args([
-            "build",
-            "--rebuild",
-            "--option",
-            "substitute",
-            "false",
-            reference.as_str(),
-            "--no-link",
-        ])
+        .args(build_args(reference.as_str(), substitute))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -117,6 +109,18 @@ pub async fn build(package: &Package, quiet: bool) -> Result<BuildRun> {
         started_at,
         finished_at,
     })
+}
+
+fn build_args(reference: &str, substitute: bool) -> [&str; 7] {
+    [
+        "build",
+        "--rebuild",
+        "--option",
+        "substitute",
+        if substitute { "true" } else { "false" },
+        reference,
+        "--no-link",
+    ]
 }
 
 async fn capture_stream<R, W>(mut reader: R, mut writer: W, echo: bool) -> Result<String>
@@ -247,6 +251,27 @@ fn take_only_entry_with_value<T>(
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn build_args_disable_substitutes_by_default() {
+        assert_eq!(
+            build_args("nixpkgs#hello", false),
+            [
+                "build",
+                "--rebuild",
+                "--option",
+                "substitute",
+                "false",
+                "nixpkgs#hello",
+                "--no-link",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_args_can_enable_substitutes() {
+        assert_eq!(build_args("nixpkgs#hello", true)[4], "true");
+    }
 
     #[test]
     fn path_info_deserializes_build_statement_fields() {

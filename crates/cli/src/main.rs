@@ -33,6 +33,9 @@ enum Command {
         /// Suppress Nix build output
         #[arg(long)]
         quiet: bool,
+        /// Allow Nix to obtain build outputs from substituters
+        #[arg(long)]
+        substitute: bool,
         /// Additional claim to include; the build claim is always included
         #[arg(long = "claim", value_enum)]
         claims: Vec<ClaimKind>,
@@ -58,15 +61,21 @@ async fn main() -> Result<()> {
             builder_id,
             server,
             quiet,
+            substitute,
             claims,
         } => {
             let package = utils::parse_nix_repository(&package_ref).with_context(|| {
                 "package reference must have the form <flake>#<attribute>, for example nixpkgs#hello"
             })?;
             let enabled_claims = ClaimKind::with_required_build(claims);
-            let evidence =
-                build::evidence::generate_evidence(package, builder_id, quiet, enabled_claims)
-                    .await?;
+            let evidence = build::evidence::generate_evidence(
+                package,
+                builder_id,
+                quiet,
+                substitute,
+                enabled_claims,
+            )
+            .await?;
             let registry = client::RegistryClient::new(&server)?;
             let receipt = registry.submit(&evidence).await?;
             let derivation_path = evidence
@@ -107,12 +116,32 @@ mod tests {
             "127.0.0.1:3000",
         ])
         .unwrap();
-        let Command::Build { claims, .. } = cli.command;
+        let Command::Build {
+            claims, substitute, ..
+        } = cli.command;
         assert!(claims.is_empty());
+        assert!(!substitute);
         assert_eq!(
             crate::claims::ClaimKind::with_required_build(claims),
             vec![crate::claims::ClaimKind::Build]
         );
+    }
+
+    #[test]
+    fn build_accepts_substitute_option() {
+        let cli = Cli::try_parse_from([
+            "reproductive-nix-cache",
+            "build",
+            "nixpkgs#hello",
+            "--builder-id",
+            "builder-a",
+            "--server",
+            "127.0.0.1:3000",
+            "--substitute",
+        ])
+        .unwrap();
+        let Command::Build { substitute, .. } = cli.command;
+        assert!(substitute);
     }
 
     #[test]
