@@ -5,8 +5,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use shared::{
-    BuildClaim, BuildStatement, Claim, EVIDENCE_SCHEMA_VERSION, Evidence, LogClaim, Package,
-    ResolvedSource,
+    BuildClaim, BuildOutput, BuildStatement, Claim, EVIDENCE_SCHEMA_VERSION, Evidence, LogClaim,
+    Package, ResolvedSource,
 };
 
 /// Rebuild an output, optionally using substitutes, then collect the facts
@@ -27,14 +27,14 @@ pub async fn generate_evidence(
     let source = nix::resolve_source(&package.repository).await?;
     let derivation_path = nix::derivation_path(&package).await?;
     let run = nix::build(&package, quiet, substitute).await?;
-    let output = nix::output_info(&package).await?;
+    let outputs = nix::output_info(&run.outputs).await?;
 
     Ok(compose_evidence(
         package,
         builder_id,
         source,
         derivation_path,
-        output,
+        outputs,
         run,
         ClaimKind::with_required_build(enabled_claims),
     ))
@@ -45,7 +45,7 @@ fn compose_evidence(
     builder_id: String,
     source: ResolvedSource,
     derivation_path: String,
-    output: nix::OutputInfo,
+    outputs: Vec<nix::OutputInfo>,
     run: nix::BuildRun,
     enabled_claims: Vec<ClaimKind>,
 ) -> Evidence {
@@ -56,18 +56,26 @@ fn compose_evidence(
         finished_at: run.finished_at,
     };
     let build_log_digest = Some(digest_build_log(&log));
-    let closure_root = output.output_path.clone();
+    let outputs = outputs
+        .into_iter()
+        .map(|output| {
+            let closure_root = output.output_path.clone();
+            BuildOutput {
+                output_name: output.output_name,
+                output_store_path: output.output_path,
+                nar_hash: output.nar_hash,
+                nar_size: output.nar_size,
+                references: output.references,
+                closure_root,
+                content_addressed: output.content_addressed,
+            }
+        })
+        .collect();
     let build = BuildClaim {
         source,
         derivation_path,
         build_statement: BuildStatement {
-            output_name: output.output_name,
-            output_store_path: output.output_path,
-            nar_hash: output.nar_hash,
-            nar_size: output.nar_size,
-            references: output.references,
-            closure_root,
-            content_addressed: output.content_addressed,
+            outputs,
             build_log_digest,
             sbom_digest: None,
             test_result_digest: None,
@@ -135,19 +143,30 @@ mod tests {
                 nar_hash: Some("sha256-source".into()),
             },
             "/nix/store/hello.drv".into(),
-            nix::OutputInfo {
-                output_name: "out".into(),
-                output_path: "/nix/store/hello".into(),
-                nar_hash: "sha256-output".into(),
-                nar_size: 1234,
-                references: vec!["/nix/store/glibc".into()],
-                content_addressed: None,
-            },
+            vec![
+                nix::OutputInfo {
+                    output_name: "bin".into(),
+                    output_path: "/nix/store/hello-bin".into(),
+                    nar_hash: "sha256-bin".into(),
+                    nar_size: 1234,
+                    references: vec!["/nix/store/glibc".into()],
+                    content_addressed: None,
+                },
+                nix::OutputInfo {
+                    output_name: "man".into(),
+                    output_path: "/nix/store/hello-man".into(),
+                    nar_hash: "sha256-man".into(),
+                    nar_size: 567,
+                    references: vec![],
+                    content_addressed: None,
+                },
+            ],
             nix::BuildRun {
                 stdout: "stdout\n".into(),
                 stderr: "stderr\n".into(),
                 started_at,
                 finished_at,
+                outputs: Default::default(),
             },
             vec![ClaimKind::Build],
         );
@@ -156,10 +175,18 @@ mod tests {
         let Claim::Build(build) = &evidence.claims[0] else {
             panic!("expected build claim")
         };
-        assert_eq!(build.build_statement.output_name, "out");
-        assert_eq!(build.build_statement.nar_size, 1234);
-        assert_eq!(build.build_statement.references, vec!["/nix/store/glibc"]);
-        assert_eq!(build.build_statement.closure_root, "/nix/store/hello");
+        assert_eq!(build.build_statement.outputs.len(), 2);
+        assert_eq!(build.build_statement.outputs[0].output_name, "bin");
+        assert_eq!(build.build_statement.outputs[0].nar_size, 1234);
+        assert_eq!(build.build_statement.outputs[1].output_name, "man");
+        assert_eq!(
+            build.build_statement.outputs[0].references,
+            vec!["/nix/store/glibc"]
+        );
+        assert_eq!(
+            build.build_statement.outputs[0].closure_root,
+            "/nix/store/hello-bin"
+        );
         assert!(
             build
                 .build_statement
@@ -185,19 +212,20 @@ mod tests {
                 nar_hash: Some("sha256-source".into()),
             },
             "/nix/store/hello.drv".into(),
-            nix::OutputInfo {
+            vec![nix::OutputInfo {
                 output_name: "out".into(),
                 output_path: "/nix/store/hello".into(),
                 nar_hash: "sha256-output".into(),
                 nar_size: 1234,
                 references: vec!["/nix/store/glibc".into()],
                 content_addressed: Some("fixed:r:sha256:example".into()),
-            },
+            }],
             nix::BuildRun {
                 stdout: "stdout\n".into(),
                 stderr: "stderr\n".into(),
                 started_at,
                 finished_at,
+                outputs: Default::default(),
             },
             vec![ClaimKind::Build, ClaimKind::Log],
         );
@@ -208,7 +236,9 @@ mod tests {
             unreachable!()
         };
         assert_eq!(
-            build.build_statement.content_addressed.as_deref(),
+            build.build_statement.outputs[0]
+                .content_addressed
+                .as_deref(),
             Some("fixed:r:sha256:example")
         );
         assert!(

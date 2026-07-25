@@ -90,13 +90,6 @@ pub mod build_claim {
         pub source_revision: Option<String>,
         pub source_nar_hash: Option<String>,
         pub derivation_path: String,
-        pub output_name: String,
-        pub output_store_path: String,
-        pub nar_hash: String,
-        pub nar_size: i64,
-        pub references_json: String,
-        pub closure_root: String,
-        pub content_addressed: Option<String>,
         pub build_log_digest: Option<String>,
         pub sbom_digest: Option<String>,
         pub test_result_digest: Option<String>,
@@ -113,11 +106,59 @@ pub mod build_claim {
             on_delete = "Cascade"
         )]
         Claim,
+        #[sea_orm(has_many = "super::build_output::Entity")]
+        BuildOutput,
     }
 
     impl Related<super::claim::Entity> for Entity {
         fn to() -> RelationDef {
             Relation::Claim.def()
+        }
+    }
+
+    impl Related<super::build_output::Entity> for Entity {
+        fn to() -> RelationDef {
+            Relation::BuildOutput.def()
+        }
+    }
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod build_output {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "build_outputs")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub claim_id: i64,
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub position: i64,
+        pub output_name: String,
+        pub output_store_path: String,
+        pub nar_hash: String,
+        pub nar_size: i64,
+        pub references_json: String,
+        pub closure_root: String,
+        pub content_addressed: Option<String>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {
+        #[sea_orm(
+            belongs_to = "super::build_claim::Entity",
+            from = "Column::ClaimId",
+            to = "super::build_claim::Column::ClaimId",
+            on_update = "Cascade",
+            on_delete = "Cascade"
+        )]
+        BuildClaim,
+    }
+
+    impl Related<super::build_claim::Entity> for Entity {
+        fn to() -> RelationDef {
+            Relation::BuildClaim.def()
         }
     }
 

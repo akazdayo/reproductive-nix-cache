@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-pub const EVIDENCE_SCHEMA_VERSION: u32 = 3;
+pub const EVIDENCE_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Package {
@@ -74,34 +74,57 @@ impl Evidence {
                         1024,
                     )?;
                     validate_text("build.derivation_path", &build.derivation_path, 4096)?;
-                    validate_text(
-                        "build.build_statement.output_name",
-                        &build.build_statement.output_name,
-                        1024,
-                    )?;
-                    validate_text(
-                        "build.build_statement.output_store_path",
-                        &build.build_statement.output_store_path,
-                        4096,
-                    )?;
-                    validate_text(
-                        "build.build_statement.nar_hash",
-                        &build.build_statement.nar_hash,
-                        1024,
-                    )?;
-                    for reference in &build.build_statement.references {
-                        validate_text("build.build_statement.references[]", reference, 4096)?;
+                    if build.build_statement.outputs.is_empty() {
+                        return Err("build.build_statement.outputs must not be empty".into());
                     }
-                    validate_text(
-                        "build.build_statement.closure_root",
-                        &build.build_statement.closure_root,
-                        4096,
-                    )?;
-                    validate_optional_text(
-                        "build.build_statement.content_addressed",
-                        build.build_statement.content_addressed.as_deref(),
-                        1024,
-                    )?;
+                    let mut output_names = std::collections::BTreeSet::new();
+                    let mut output_paths = std::collections::BTreeSet::new();
+                    for output in &build.build_statement.outputs {
+                        validate_text(
+                            "build.build_statement.outputs[].output_name",
+                            &output.output_name,
+                            1024,
+                        )?;
+                        validate_text(
+                            "build.build_statement.outputs[].output_store_path",
+                            &output.output_store_path,
+                            4096,
+                        )?;
+                        validate_text(
+                            "build.build_statement.outputs[].nar_hash",
+                            &output.nar_hash,
+                            1024,
+                        )?;
+                        for reference in &output.references {
+                            validate_text(
+                                "build.build_statement.outputs[].references[]",
+                                reference,
+                                4096,
+                            )?;
+                        }
+                        validate_text(
+                            "build.build_statement.outputs[].closure_root",
+                            &output.closure_root,
+                            4096,
+                        )?;
+                        validate_optional_text(
+                            "build.build_statement.outputs[].content_addressed",
+                            output.content_addressed.as_deref(),
+                            1024,
+                        )?;
+                        if !output_names.insert(&output.output_name) {
+                            return Err(format!(
+                                "duplicate build output name: {}",
+                                output.output_name
+                            ));
+                        }
+                        if !output_paths.insert(&output.output_store_path) {
+                            return Err(format!(
+                                "duplicate build output store path: {}",
+                                output.output_store_path
+                            ));
+                        }
+                    }
                     validate_optional_text(
                         "build.build_statement.build_log_digest",
                         build.build_statement.build_log_digest.as_deref(),
@@ -172,13 +195,18 @@ pub struct BuildClaim {
     pub built_at: DateTime<Utc>,
 }
 
-/// Facts that identify one concrete output produced by a Nix build.
-///
-/// This is the innermost layer of the attestation model. Execution evidence,
-/// attestation results, and collective records can wrap it without flattening
-/// output facts into their own envelopes.
+/// Facts that identify all selected outputs produced by a Nix build.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildStatement {
+    pub outputs: Vec<BuildOutput>,
+    /// Digests are optional until the corresponding artifact is collected.
+    pub build_log_digest: Option<String>,
+    pub sbom_digest: Option<String>,
+    pub test_result_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildOutput {
     pub output_name: String,
     pub output_store_path: String,
     pub nar_hash: String,
@@ -187,10 +215,6 @@ pub struct BuildStatement {
     pub closure_root: String,
     /// Nix's content address (`ca` in `nix path-info --json`), when present.
     pub content_addressed: Option<String>,
-    /// Digests are optional until the corresponding artifact is collected.
-    pub build_log_digest: Option<String>,
-    pub sbom_digest: Option<String>,
-    pub test_result_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -247,13 +271,15 @@ mod tests {
                     },
                     derivation_path: "/nix/store/hello.drv".into(),
                     build_statement: BuildStatement {
-                        output_name: "out".into(),
-                        output_store_path: "/nix/store/hello".into(),
-                        nar_hash: "sha256-output".into(),
-                        nar_size: 1234,
-                        references: vec!["/nix/store/glibc".into()],
-                        closure_root: "/nix/store/hello".into(),
-                        content_addressed: None,
+                        outputs: vec![BuildOutput {
+                            output_name: "out".into(),
+                            output_store_path: "/nix/store/hello".into(),
+                            nar_hash: "sha256-output".into(),
+                            nar_size: 1234,
+                            references: vec!["/nix/store/glibc".into()],
+                            closure_root: "/nix/store/hello".into(),
+                            content_addressed: None,
+                        }],
                         build_log_digest: None,
                         sbom_digest: None,
                         test_result_digest: None,
@@ -286,7 +312,7 @@ mod tests {
         let value = serde_json::to_value(&evidence).unwrap();
         assert_eq!(value["claims"][0]["type"], "build");
         assert_eq!(
-            value["claims"][0]["payload"]["build_statement"]["output_store_path"],
+            value["claims"][0]["payload"]["build_statement"]["outputs"][0]["output_store_path"],
             "/nix/store/hello"
         );
         assert_eq!(value["claims"][1]["type"], "log");
@@ -329,10 +355,10 @@ mod tests {
         let Claim::Build(build) = &mut evidence.claims[0] else {
             unreachable!()
         };
-        build.build_statement.nar_hash.clear();
+        build.build_statement.outputs[0].nar_hash.clear();
         assert_eq!(
             evidence.validate().unwrap_err(),
-            "build.build_statement.nar_hash must not be empty"
+            "build.build_statement.outputs[].nar_hash must not be empty"
         );
 
         let mut evidence = claim_evidence();
@@ -343,6 +369,32 @@ mod tests {
         assert_eq!(
             evidence.validate().unwrap_err(),
             "log.finished_at must not be earlier than log.started_at"
+        );
+    }
+
+    #[test]
+    fn validation_requires_unique_nonempty_outputs() {
+        let mut evidence = claim_evidence();
+        let Claim::Build(build) = &mut evidence.claims[0] else {
+            unreachable!()
+        };
+        build.build_statement.outputs.clear();
+        assert_eq!(
+            evidence.validate().unwrap_err(),
+            "build.build_statement.outputs must not be empty"
+        );
+
+        let mut evidence = claim_evidence();
+        let Claim::Build(build) = &mut evidence.claims[0] else {
+            unreachable!()
+        };
+        build
+            .build_statement
+            .outputs
+            .push(build.build_statement.outputs[0].clone());
+        assert_eq!(
+            evidence.validate().unwrap_err(),
+            "duplicate build output name: out"
         );
     }
 

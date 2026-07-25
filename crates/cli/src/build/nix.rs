@@ -22,6 +22,12 @@ pub struct BuildRun {
     pub stderr: String,
     pub started_at: DateTime<Utc>,
     pub finished_at: DateTime<Utc>,
+    pub outputs: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NixBuildResult {
+    outputs: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,16 +108,18 @@ pub async fn build(package: &Package, quiet: bool, substitute: bool) -> Result<B
     if !status.success() {
         bail!("nix build failed with exit status: {status}");
     }
+    let outputs = parse_build_outputs(&stdout)?;
 
     Ok(BuildRun {
         stdout,
         stderr,
         started_at,
         finished_at,
+        outputs,
     })
 }
 
-fn build_args(reference: &str, substitute: bool) -> [&str; 7] {
+fn build_args(reference: &str, substitute: bool) -> [&str; 8] {
     [
         "build",
         "--rebuild",
@@ -120,7 +128,24 @@ fn build_args(reference: &str, substitute: bool) -> [&str; 7] {
         if substitute { "true" } else { "false" },
         reference,
         "--no-link",
+        "--json",
     ]
+}
+
+fn parse_build_outputs(stdout: &str) -> Result<BTreeMap<String, String>> {
+    let mut results: Vec<NixBuildResult> =
+        serde_json::from_str(stdout).context("failed to parse JSON from nix build")?;
+    if results.len() != 1 {
+        bail!(
+            "nix build returned {} build results; expected exactly one",
+            results.len()
+        );
+    }
+    let outputs = results.pop().expect("length was checked").outputs;
+    if outputs.is_empty() {
+        bail!("nix build returned no outputs");
+    }
+    Ok(outputs)
 }
 
 async fn capture_stream<R, W>(mut reader: R, mut writer: W, echo: bool) -> Result<String>
@@ -154,54 +179,47 @@ where
     Ok(String::from_utf8_lossy(&collected).into_owned())
 }
 
-pub async fn output_info(package: &Package) -> Result<OutputInfo> {
-    let reference = package.reference();
-    let output_attribute = format!("{reference}.outputName");
-    let output_name = run_text(["eval", "--raw", output_attribute.as_str()]).await?;
-    let entries: BTreeMap<String, NixPathInfo> = run_json([
-        "path-info",
-        "--json-format",
-        "1",
-        "--json",
-        reference.as_str(),
-    ])
-    .await?;
-    let (output_path, info) = take_only_entry_with_value(entries, "nix path-info")?;
+pub async fn output_info(outputs: &BTreeMap<String, String>) -> Result<Vec<OutputInfo>> {
+    if outputs.is_empty() {
+        bail!("cannot query metadata for an empty output set");
+    }
+    let mut args = vec![
+        "path-info".to_owned(),
+        "--json-format".to_owned(),
+        "1".to_owned(),
+        "--json".to_owned(),
+    ];
+    args.extend(outputs.values().cloned());
+    let entries: BTreeMap<String, NixPathInfo> = run_json(args).await?;
 
-    Ok(OutputInfo {
-        output_name,
-        output_path,
-        nar_hash: info.nar_hash,
-        nar_size: info.nar_size,
-        references: info.references,
-        content_addressed: info.ca,
-    })
+    collect_output_info(outputs, entries)
 }
 
-async fn run_text<I, S>(args: I) -> Result<String>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<std::ffi::OsStr>,
-{
-    let output = Command::new("nix")
-        .args(args)
-        .output()
-        .await
-        .context("failed to start nix")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+fn collect_output_info(
+    outputs: &BTreeMap<String, String>,
+    mut entries: BTreeMap<String, NixPathInfo>,
+) -> Result<Vec<OutputInfo>> {
+    let mut result = Vec::with_capacity(outputs.len());
+    for (output_name, output_path) in outputs {
+        let info = entries.remove(output_path).with_context(|| {
+            format!("nix path-info did not return the built output {output_name} at {output_path}")
+        })?;
+        result.push(OutputInfo {
+            output_name: output_name.clone(),
+            output_path: output_path.clone(),
+            nar_hash: info.nar_hash,
+            nar_size: info.nar_size,
+            references: info.references,
+            content_addressed: info.ca,
+        });
+    }
+    if !entries.is_empty() {
         bail!(
-            "nix command failed with exit status {}: {stderr}",
-            output.status
+            "nix path-info returned {} unexpected outputs",
+            entries.len()
         );
     }
-
-    let value = String::from_utf8(output.stdout).context("nix returned non-UTF-8 text")?;
-    let value = value.trim().to_owned();
-    if value.is_empty() {
-        bail!("nix returned empty text");
-    }
-    Ok(value)
+    Ok(result)
 }
 
 async fn run_json<T, I, S>(args: I) -> Result<T>
@@ -264,6 +282,7 @@ mod tests {
                 "false",
                 "nixpkgs#hello",
                 "--no-link",
+                "--json",
             ]
         );
     }
@@ -274,24 +293,57 @@ mod tests {
     }
 
     #[test]
-    fn path_info_deserializes_build_statement_fields() {
+    fn build_json_preserves_all_selected_outputs() {
+        let outputs = parse_build_outputs(
+            r#"[{
+                "drvPath": "/nix/store/openssl.drv",
+                "outputs": {
+                    "bin": "/nix/store/openssl-bin",
+                    "man": "/nix/store/openssl-man"
+                }
+            }]"#,
+        )
+        .unwrap();
+
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs["bin"], "/nix/store/openssl-bin");
+        assert_eq!(outputs["man"], "/nix/store/openssl-man");
+    }
+
+    #[test]
+    fn path_info_is_joined_with_every_built_output() {
+        let outputs = BTreeMap::from([
+            ("bin".into(), "/nix/store/openssl-bin".into()),
+            ("man".into(), "/nix/store/openssl-man".into()),
+        ]);
         let entries: BTreeMap<String, NixPathInfo> = serde_json::from_str(
             r#"{
-                "/nix/store/example": {
-                    "narHash": "sha256-output",
+                "/nix/store/openssl-bin": {
+                    "narHash": "sha256-bin",
                     "narSize": 1234,
                     "references": ["/nix/store/glibc"],
+                    "ca": null
+                },
+                "/nix/store/openssl-man": {
+                    "narHash": "sha256-man",
+                    "narSize": 567,
+                    "references": [],
                     "ca": "fixed:r:sha256:example"
                 }
             }"#,
         )
         .unwrap();
-        let (_, info) = take_only_entry_with_value(entries, "nix path-info").unwrap();
+        let info = collect_output_info(&outputs, entries).unwrap();
 
-        assert_eq!(info.nar_hash, "sha256-output");
-        assert_eq!(info.nar_size, 1234);
-        assert_eq!(info.references, vec!["/nix/store/glibc"]);
-        assert_eq!(info.ca.as_deref(), Some("fixed:r:sha256:example"));
+        assert_eq!(info.len(), 2);
+        assert_eq!(info[0].output_name, "bin");
+        assert_eq!(info[0].nar_hash, "sha256-bin");
+        assert_eq!(info[1].output_name, "man");
+        assert_eq!(info[1].nar_size, 567);
+        assert_eq!(
+            info[1].content_addressed.as_deref(),
+            Some("fixed:r:sha256:example")
+        );
     }
 
     #[test]

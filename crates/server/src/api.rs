@@ -131,8 +131,8 @@ mod tests {
     };
     use chrono::{Duration, Utc};
     use shared::{
-        BuildClaim, BuildStatement, Claim, EVIDENCE_SCHEMA_VERSION, Evidence, EvidenceReceipt,
-        LogClaim, Package, ResolvedSource,
+        BuildClaim, BuildOutput, BuildStatement, Claim, EVIDENCE_SCHEMA_VERSION, Evidence,
+        EvidenceReceipt, LogClaim, Package, ResolvedSource,
     };
     use tower::ServiceExt;
 
@@ -155,13 +155,15 @@ mod tests {
                     },
                     derivation_path: "/nix/store/example-hello.drv".into(),
                     build_statement: BuildStatement {
-                        output_name: "out".into(),
-                        output_store_path: "/nix/store/example-hello".into(),
-                        nar_hash: nar_hash.into(),
-                        nar_size: 1234,
-                        references: vec!["/nix/store/glibc".into()],
-                        closure_root: "/nix/store/example-hello".into(),
-                        content_addressed: None,
+                        outputs: vec![BuildOutput {
+                            output_name: "out".into(),
+                            output_store_path: "/nix/store/example-hello".into(),
+                            nar_hash: nar_hash.into(),
+                            nar_size: 1234,
+                            references: vec!["/nix/store/glibc".into()],
+                            closure_root: "/nix/store/example-hello".into(),
+                            content_addressed: None,
+                        }],
                         build_log_digest: None,
                         sbom_digest: None,
                         test_result_digest: None,
@@ -236,6 +238,7 @@ mod tests {
                 .build_claim()
                 .unwrap()
                 .build_statement
+                .outputs[0]
                 .nar_hash,
             "sha256-out"
         );

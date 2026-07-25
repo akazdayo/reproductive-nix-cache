@@ -6,11 +6,11 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct TrustScore {
     pub derivation_path: String,
     pub score: u8,
-    pub consensus_nar_hash: Option<String>,
+    pub consensus_outputs: Option<Vec<OutputHash>>,
     pub total_builders: usize,
     pub matching_builders: usize,
     pub status: ConsensusStatus,
-    pub variants: Vec<NarHashFact>,
+    pub variants: Vec<OutputSetFact>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -21,35 +21,52 @@ pub enum ConsensusStatus {
     Consensus,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct NarHashFact {
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct OutputHash {
+    pub output_name: String,
     pub nar_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OutputSetFact {
+    pub outputs: Vec<OutputHash>,
     pub builder_count: usize,
 }
 
 /// Calculate a local, explainable score from raw registry facts.
 ///
-/// A unique leading hash gets 33, 67, or 100 points for one, two, or at least
-/// three matching builders; disagreement multiplies that value by the leading
-/// hash's share of all unique builders. A tie deliberately has no consensus.
+/// A unique leading output set gets 33, 67, or 100 points for one, two, or at
+/// least three matching builders; disagreement multiplies that value by the
+/// leading set's share of all unique builders. A tie deliberately has no
+/// consensus.
 pub fn calculate_trust(facts: &EvidenceList) -> TrustScore {
-    let mut variants: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut variants: BTreeMap<Vec<OutputHash>, BTreeSet<String>> = BTreeMap::new();
     let mut all_builders = BTreeSet::new();
     for stored in &facts.evidences {
         let Some(build) = stored.evidence.build_claim() else {
             continue;
         };
         all_builders.insert(stored.evidence.builder_id.clone());
+        let mut outputs = build
+            .build_statement
+            .outputs
+            .iter()
+            .map(|output| OutputHash {
+                output_name: output.output_name.clone(),
+                nar_hash: output.nar_hash.clone(),
+            })
+            .collect::<Vec<_>>();
+        outputs.sort();
         variants
-            .entry(build.build_statement.nar_hash.clone())
+            .entry(outputs)
             .or_default()
             .insert(stored.evidence.builder_id.clone());
     }
 
     let variants = variants
         .into_iter()
-        .map(|(nar_hash, builders)| NarHashFact {
-            nar_hash,
+        .map(|(outputs, builders)| OutputSetFact {
+            outputs,
             builder_count: builders.len(),
         })
         .collect::<Vec<_>>();
@@ -58,7 +75,7 @@ pub fn calculate_trust(facts: &EvidenceList) -> TrustScore {
         return TrustScore {
             derivation_path: facts.derivation_path.clone(),
             score: 0,
-            consensus_nar_hash: None,
+            consensus_outputs: None,
             total_builders: 0,
             matching_builders: 0,
             status: ConsensusStatus::NoEvidence,
@@ -73,7 +90,7 @@ pub fn calculate_trust(facts: &EvidenceList) -> TrustScore {
         return TrustScore {
             derivation_path: facts.derivation_path.clone(),
             score: 0,
-            consensus_nar_hash: None,
+            consensus_outputs: None,
             total_builders,
             matching_builders: 0,
             status: ConsensusStatus::NoUniqueConsensus,
@@ -86,7 +103,7 @@ pub fn calculate_trust(facts: &EvidenceList) -> TrustScore {
     TrustScore {
         derivation_path: facts.derivation_path.clone(),
         score,
-        consensus_nar_hash: Some(leaders[0].nar_hash.clone()),
+        consensus_outputs: Some(leaders[0].outputs.clone()),
         total_builders,
         matching_builders,
         status: ConsensusStatus::Consensus,
@@ -109,7 +126,7 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use shared::{
-        BuildClaim, BuildStatement, Claim, EVIDENCE_SCHEMA_VERSION, Evidence, Package,
+        BuildClaim, BuildOutput, BuildStatement, Claim, EVIDENCE_SCHEMA_VERSION, Evidence, Package,
         ResolvedSource, StoredEvidence,
     };
 
@@ -136,13 +153,15 @@ mod tests {
                             },
                             derivation_path: "/nix/store/example.drv".into(),
                             build_statement: BuildStatement {
-                                output_name: "out".into(),
-                                output_store_path: "/nix/store/example".into(),
-                                nar_hash: (*nar_hash).into(),
-                                nar_size: 1234,
-                                references: vec![],
-                                closure_root: "/nix/store/example".into(),
-                                content_addressed: None,
+                                outputs: vec![BuildOutput {
+                                    output_name: "out".into(),
+                                    output_store_path: "/nix/store/example".into(),
+                                    nar_hash: (*nar_hash).into(),
+                                    nar_size: 1234,
+                                    references: vec![],
+                                    closure_root: "/nix/store/example".into(),
+                                    content_addressed: None,
+                                }],
                                 build_log_digest: None,
                                 sbom_digest: None,
                                 test_result_digest: None,
@@ -184,6 +203,41 @@ mod tests {
         let tied = calculate_trust(&facts(&[("a", "one"), ("b", "two")]));
         assert_eq!(tied.score, 0);
         assert_eq!(tied.status, ConsensusStatus::NoUniqueConsensus);
+    }
+
+    #[test]
+    fn consensus_compares_the_complete_output_set() {
+        let mut facts = facts(&[("a", "same"), ("b", "same")]);
+        for (stored, man_hash) in facts
+            .evidences
+            .iter_mut()
+            .zip(["sha256-man-one", "sha256-man-two"])
+        {
+            stored
+                .evidence
+                .claims
+                .iter_mut()
+                .find_map(|claim| match claim {
+                    Claim::Build(build) => Some(build),
+                    Claim::Log(_) => None,
+                })
+                .unwrap()
+                .build_statement
+                .outputs
+                .push(BuildOutput {
+                    output_name: "man".into(),
+                    output_store_path: "/nix/store/example-man".into(),
+                    nar_hash: man_hash.into(),
+                    nar_size: 567,
+                    references: vec![],
+                    closure_root: "/nix/store/example-man".into(),
+                    content_addressed: None,
+                });
+        }
+
+        let score = calculate_trust(&facts);
+        assert_eq!(score.score, 0);
+        assert_eq!(score.status, ConsensusStatus::NoUniqueConsensus);
     }
 
     #[test]
