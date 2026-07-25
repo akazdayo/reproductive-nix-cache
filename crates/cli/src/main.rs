@@ -1,6 +1,7 @@
 mod build;
 mod claims;
 mod client;
+mod output;
 mod trust;
 mod utils;
 
@@ -39,6 +40,9 @@ enum Command {
         /// Additional claim to include; the build claim is always included
         #[arg(long = "claim", value_enum)]
         claims: Vec<ClaimKind>,
+        /// Print the complete result as JSON instead of a human-readable summary
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -63,6 +67,7 @@ async fn main() -> Result<()> {
             quiet,
             substitute,
             claims,
+            json,
         } => {
             let package = utils::parse_nix_repository(&package_ref).with_context(|| {
                 "package reference must have the form <flake>#<attribute>, for example nixpkgs#hello"
@@ -86,15 +91,17 @@ async fn main() -> Result<()> {
             let facts = registry.facts(&derivation_path).await?;
             let trust = trust::calculate_trust(&facts);
 
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&BuildResult {
-                    evidence,
-                    receipt,
-                    facts,
-                    trust,
-                })?
-            );
+            let result = BuildResult {
+                evidence,
+                receipt,
+                facts,
+                trust,
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!("{}", output::format_build_summary(&result));
+            }
         }
     }
     Ok(())
@@ -142,6 +149,23 @@ mod tests {
         .unwrap();
         let Command::Build { substitute, .. } = cli.command;
         assert!(substitute);
+    }
+
+    #[test]
+    fn build_accepts_json_output_option() {
+        let cli = Cli::try_parse_from([
+            "reproductive-nix-cache",
+            "build",
+            "nixpkgs#hello",
+            "--builder-id",
+            "builder-a",
+            "--server",
+            "127.0.0.1:3000",
+            "--json",
+        ])
+        .unwrap();
+        let Command::Build { json, .. } = cli.command;
+        assert!(json);
     }
 
     #[test]

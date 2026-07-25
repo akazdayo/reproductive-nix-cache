@@ -99,7 +99,9 @@ pub async fn build(package: &Package, quiet: bool, substitute: bool) -> Result<B
     let stderr = child.stderr.take().context("nix stderr was not piped")?;
     let wait = async move { child.wait().await.context("failed to wait for nix build") };
     let (stdout, stderr, status) = tokio::try_join!(
-        capture_stream(stdout, tokio::io::stdout(), !quiet),
+        // stdout contains the internal `nix build --json` result. Keep it for
+        // evidence collection without mixing it into the CLI's final output.
+        capture_stream(stdout, tokio::io::stdout(), false),
         capture_stream(stderr, tokio::io::stderr(), !quiet),
         wait,
     )?;
