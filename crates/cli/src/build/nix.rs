@@ -197,6 +197,47 @@ pub async fn output_info(outputs: &BTreeMap<String, String>) -> Result<Vec<Outpu
     collect_output_info(outputs, entries)
 }
 
+pub async fn copy_to_cache(cache_url: &str, output_paths: &[String], quiet: bool) -> Result<()> {
+    if output_paths.is_empty() {
+        bail!("cannot copy an empty output set to the binary cache");
+    }
+
+    let mut child = Command::new("nix")
+        .args(copy_args(cache_url, output_paths))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to start nix copy")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("nix copy stdout was not piped")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("nix copy stderr was not piped")?;
+    let wait = async move { child.wait().await.context("failed to wait for nix copy") };
+    let (_, stderr, status) = tokio::try_join!(
+        // Keep stdout reserved for the CLI's final human-readable or JSON
+        // result. Nix reports copy progress on stderr.
+        capture_stream(stdout, tokio::io::stdout(), false),
+        capture_stream(stderr, tokio::io::stderr(), !quiet),
+        wait,
+    )?;
+
+    if !status.success() {
+        bail!("nix copy failed with exit status {status}: {stderr}");
+    }
+
+    Ok(())
+}
+
+fn copy_args(cache_url: &str, output_paths: &[String]) -> Vec<String> {
+    let mut args = vec!["copy".into(), "--to".into(), cache_url.into()];
+    args.extend(output_paths.iter().cloned());
+    args
+}
+
 fn collect_output_info(
     outputs: &BTreeMap<String, String>,
     mut entries: BTreeMap<String, NixPathInfo>,
@@ -352,6 +393,28 @@ mod tests {
     fn only_entry_rejects_multiple_nix_results() {
         let entries = BTreeMap::from([("one".into(), ()), ("two".into(), ())]);
         assert!(take_only_entry(entries, "nix path-info").is_err());
+    }
+
+    #[test]
+    fn copy_args_include_every_output() {
+        let outputs = vec![
+            "/nix/store/openssl-bin".into(),
+            "/nix/store/openssl-man".into(),
+        ];
+
+        assert_eq!(
+            copy_args(
+                "s3://nix-cache?scheme=http&endpoint=127.0.0.1:9000",
+                &outputs
+            ),
+            [
+                "copy",
+                "--to",
+                "s3://nix-cache?scheme=http&endpoint=127.0.0.1:9000",
+                "/nix/store/openssl-bin",
+                "/nix/store/openssl-man",
+            ]
+        );
     }
 
     #[tokio::test]

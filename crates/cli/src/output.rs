@@ -34,6 +34,18 @@ pub fn format_build_summary(result: &BuildResult) -> String {
         }
     }
 
+    if let Some(cache) = &result.cache {
+        writeln!(summary).unwrap();
+        writeln!(summary, "Binary cache").unwrap();
+        writeln!(summary, "  Store        {}", cache.store_url).unwrap();
+        writeln!(
+            summary,
+            "  Uploaded     {} outputs",
+            cache.output_paths.len()
+        )
+        .unwrap();
+    }
+
     writeln!(summary).unwrap();
     writeln!(summary, "Trust").unwrap();
     writeln!(summary, "  Score        {}/100", trust.score).unwrap();
@@ -107,6 +119,7 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CacheUpload;
     use crate::trust::{OutputHash, OutputSetFact, TrustScore};
     use chrono::Utc;
     use shared::{
@@ -158,6 +171,10 @@ mod tests {
 
         BuildResult {
             evidence,
+            cache: Some(CacheUpload {
+                store_url: "s3://nix-cache".into(),
+                output_paths: vec!["/nix/store/hello".into()],
+            }),
             receipt: EvidenceReceipt {
                 inserted: true,
                 evidence: stored.clone(),
@@ -195,6 +212,8 @@ mod tests {
         assert!(summary.contains("Package       nixpkgs#hello"));
         assert!(summary.contains("Evidence      #42 (registered)"));
         assert!(summary.contains("NAR size   1.2 KiB"));
+        assert!(summary.contains("Store        s3://nix-cache"));
+        assert!(summary.contains("Uploaded     1 outputs"));
         assert!(summary.contains("Score        33/100"));
         assert!(summary.contains("Consensus    1/1 builders agree"));
         assert!(summary.contains("This build   matches consensus"));
