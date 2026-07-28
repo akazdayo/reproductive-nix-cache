@@ -1,41 +1,40 @@
-# AGENTS.md — reproductive-nix-cache
+# Repository Guidelines
 
-Rust CLI that collects structured build evidence from a Nix package. Calls `nix flake metadata`, `nix path-info`, `nix derivation show`, builds the package, then emits a JSON blob with resolved metadata, derivation hash, and output NAR hash.
+## Project Structure & Module Organization
 
-## Dev environment
+This Rust 2024 workspace contains three crates:
 
-- **Nix flake** with `direnv` (`use flake`). Run `direnv allow` (once) to enter.
-- **Rust edition 2024** (`Cargo.toml`). Stable toolchain via fenix overlay in `flake.nix`.
-- Standard cargo commands: `cargo build`, `cargo test`, `cargo clippy`.
-- `flake.nix` provides: `nixfmt` as the formatter, `cargo-deny`, `cargo-watch`, `cargo-edit`, `nix-output-monitor`.
-- Nix code format: `nix fmt` (backed by `nixfmt`).
+- `crates/cli`: the `reproductive-nix-cache` command. Build orchestration lives under `src/build/`; registry access, claims, trust calculation, and output formatting are separate modules.
+- `crates/server`: the Axum registry and binary-cache server. API routes, SQLite persistence, configuration, and S3-compatible object storage are split by module.
+- `crates/shared`: evidence types shared by both binaries.
 
-## Architecture
+Tests are colocated with implementation code in `#[cfg(test)]` modules. Root files include the workspace manifests, Nix flake, licenses, and a short usage-oriented `README.md`.
 
-4 source files in `src/`, single crate:
+## Build, Test, and Development Commands
 
-| File | Role |
-|---|---|
-| `main.rs` | CLI entrypoint (clap). One subcommand: `build <package_ref> [--full-rebuild]`. Serializes `NixEvidence` to JSON stdout. |
-| `models.rs` | All serde structs: `NixEvidence`, `FlakeMetadata`, `Derivation`, `PathInfo`, `PackageRef`. Tests with JSON fixtures live here. |
-| `nix.rs` | Thin wrappers around the `nix` binary via `std::process::Command`. |
-| `evidence.rs` | Orchestration: parse → resolve → derive → build → collect. |
+Enter the reproducible shell with `direnv allow` or `nix develop`. The shell supplies stable Rust, Nix tooling, RustFS, and formatting hooks.
 
-## Key gotchas
+- `cargo build --workspace`: compile every crate.
+- `cargo test --workspace`: run unit and async integration-style tests.
+- `cargo clippy --workspace --all-targets -- -D warnings`: reject Clippy warnings.
+- `nix fmt`: format Rust and Nix files through treefmt.
+- `cargo run -p server -- --help`: inspect or launch the registry server.
+- `cargo run -p cli -- build nixpkgs#hello --builder-id builder-a --server 127.0.0.1:51337`: run the client against a local server.
 
-- **`nix` must be on PATH.** The tool shells out to the `nix` binary. Without it every function in `nix.rs` returns an error.
-- **Build prefers `nom` over `nix`.** `nix::run_build` tries `nom build` first; falls back to `nix build` if `nom` isn't found. This is not a bug — it's intentional for nicer terminal output when `nom` is installed.
-- **`--no-link` on build.** The tool passes `--no-link` so the result goes into `/nix/store` but doesn't create a GC-root symlink in the working directory.
-- **Derivation lookup fallback.** `nix::select_derivation` looks up by exact `.drv` path, but if it finds only one entry in the map it returns that entry regardless of path match. This handles cases where `nix derivation show` returns a different key than `nix path-info --derivation`.
-- **flake.lock `narHash` fallback for `rev`.** In `build_evidence`, if `locked.rev` is `None`, it falls back to `locked.nar_hash`. Some flakes don't have a rev (e.g., tarball inputs).
-- **Rust edition 2024** — newer syntax/conventions apply. `ProcessCommand` is aliased because `Command` is shadowed by clap.
+The CLI shells out to `nix`; commands exercising real builds require `nix` on `PATH`.
 
-## Testing
+## Coding Style & Naming Conventions
 
-- Unit tests live in the same files (`models.rs`, `evidence.rs`) under `#[cfg(test)]`.
-- Tests are pure Rust — no external process dependency. They test JSON parsing/serialization with string fixtures.
-- Run with: `cargo test`
+Use rustfmt defaults (four-space indentation). Follow standard Rust naming: `snake_case` for modules, functions, and tests; `PascalCase` for types and enums; `SCREAMING_SNAKE_CASE` for constants. Keep CLI/server-specific behavior in its crate and move wire-format types into `shared`. Add context to fallible operations with `anyhow` and avoid exposing credentials in errors or logs.
 
-## Package reference format
+## Testing Guidelines
 
-Input must be `<flake>#<attr>` (e.g. `nixpkgs#hello`). Missing `#`, empty flake name, or empty attr path all produce errors.
+Add focused tests beside changed code. Use descriptive behavior names such as `build_accepts_s3_binary_cache`; use `#[tokio::test]` for async paths. Keep unit tests deterministic and mock or isolate storage/network boundaries. No coverage threshold is enforced, but regressions should include a test. Run formatting, Clippy, and the full workspace suite before opening a pull request.
+
+## Commit & Pull Request Guidelines
+
+History follows Conventional Commit-style prefixes, chiefly `feat:`, `fix:`, and `chore:`. Use a short, imperative subject describing one logical change. Pull requests should explain user-visible behavior, configuration or API changes, verification commands, and linked issues. Include sample CLI/HTTP output when interfaces change; screenshots are only useful for rendered output.
+
+## Security & Local Configuration
+
+Values in `flake.nix` configure loopback-only RustFS development credentials. Never reuse them in production or commit real secrets, access keys, databases, or generated `.rustfs/` data.
