@@ -11,6 +11,10 @@
       url = "github:cachix/git-hooks.nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    rustfs = {
+      url = "github:rustfs/rustfs-flake";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
     treefmt-nix = {
       url = "github:numtide/treefmt-nix";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -86,15 +90,34 @@
                 cargo-watch
                 rust-analyzer
                 nix-output-monitor
+                minio-client
+                inputs.rustfs.packages.${system}.default
                 self.formatter.${system}
               ])
               ++ self.checks.${system}.pre-commit-check.enabledPackages;
 
-            shellHook = self.checks.${system}.pre-commit-check.shellHook;
+            shellHook = ''
+              ${self.checks.${system}.pre-commit-check.shellHook}
+              mkdir -p "$RUSTFS_VOLUMES"
+            '';
 
             env = {
               # Required by rust-analyzer
               RUST_SRC_PATH = "${pkgs.rustToolchain}/lib/rustlib/src/rust/library";
+
+              # Loopback-only RustFS configuration for local development.
+              RUSTFS_ACCESS_KEY = "rustfsadmin";
+              RUSTFS_SECRET_KEY = "rustfs-development";
+              RUSTFS_VOLUMES = ".rustfs/data";
+              RUSTFS_ADDRESS = "127.0.0.1:9000";
+              RUSTFS_CONSOLE_ENABLE = "true";
+              RUSTFS_CONSOLE_ADDRESS = "127.0.0.1:9001";
+
+              # Nix uses the AWS credential provider chain for S3 stores.
+              AWS_ACCESS_KEY_ID = "rustfsadmin";
+              AWS_SECRET_ACCESS_KEY = "rustfs-development";
+              AWS_DEFAULT_REGION = "us-east-1";
+              NIX_CACHE_S3_URL = "s3://nix-cache?scheme=http&endpoint=127.0.0.1:9000&region=us-east-1";
             };
           };
         }
