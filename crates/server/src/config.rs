@@ -16,5 +16,5 @@ impl Default for Config {
 }
 
 fn default_listen_address() -> SocketAddr {
-    "[::]:3000".parse().unwrap()
+    "[::]:51337".parse().unwrap()
 }
