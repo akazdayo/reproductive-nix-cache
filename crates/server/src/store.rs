@@ -12,10 +12,32 @@ use shared::{
     BuildClaim, BuildOutput, BuildStatement, Claim, Evidence, EvidenceList, EvidenceReceipt,
     LogClaim, Package, ResolvedSource, StoredEvidence,
 };
-use std::path::Path;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 const BUILD_KIND: &str = "build";
 const LOG_KIND: &str = "log";
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct OutputFingerprint {
+    pub nar_hash: String,
+    pub nar_size: u64,
+    pub references: Vec<String>,
+}
+
+impl OutputFingerprint {
+    fn from_model(output: &build_output_entity::Model) -> Result<Self> {
+        let references: Vec<String> = serde_json::from_str(&output.references_json)
+            .context("stored build references are invalid")?;
+        Ok(Self {
+            nar_hash: output.nar_hash.clone(),
+            nar_size: u64::try_from(output.nar_size).context("stored NAR size is negative")?,
+            references: normalize_references(references),
+        })
+    }
+}
 
 #[derive(Clone)]
 pub struct EvidenceStore {
@@ -138,6 +160,18 @@ impl EvidenceStore {
             .execute(backend.build(&derivation_index))
             .await
             .context("failed to create build claim lookup index")?;
+
+        let mut output_store_path_index = Index::create();
+        output_store_path_index
+            .name("build_outputs_store_path_idx")
+            .table(build_output_entity::Entity)
+            .col(build_output_entity::Column::OutputStorePath)
+            .col(build_output_entity::Column::ClaimId)
+            .if_not_exists();
+        self.database
+            .execute(backend.build(&output_store_path_index))
+            .await
+            .context("failed to create build output lookup index")?;
 
         Ok(())
     }
@@ -271,6 +305,48 @@ impl EvidenceStore {
         })
     }
 
+    pub async fn output_consensus(
+        &self,
+        store_path: &str,
+        minimum_builders: usize,
+    ) -> Result<Option<OutputFingerprint>> {
+        let output_rows = build_output_entity::Entity::find()
+            .filter(build_output_entity::Column::OutputStorePath.eq(store_path))
+            .all(&self.database)
+            .await
+            .context("failed to query build output evidence")?;
+        let mut variants: BTreeMap<OutputFingerprint, BTreeSet<String>> = BTreeMap::new();
+        for output in output_rows {
+            let claim = claim::Entity::find_by_id(output.claim_id)
+                .one(&self.database)
+                .await?
+                .context("build output claim envelope is missing")?;
+            let evidence = evidence_entity::Entity::find_by_id(claim.evidence_id)
+                .one(&self.database)
+                .await?
+                .context("build output evidence envelope is missing")?;
+            variants
+                .entry(OutputFingerprint::from_model(&output)?)
+                .or_default()
+                .insert(evidence.builder_id);
+        }
+
+        let Some(maximum) = variants.values().map(BTreeSet::len).max() else {
+            return Ok(None);
+        };
+        let mut leaders = variants
+            .into_iter()
+            .filter(|(_, builders)| builders.len() == maximum);
+        let Some((fingerprint, builders)) = leaders.next() else {
+            return Ok(None);
+        };
+        if leaders.next().is_some() || builders.len() < minimum_builders {
+            return Ok(None);
+        }
+
+        Ok(Some(fingerprint))
+    }
+
     async fn find_by_id(&self, id: i64) -> Result<Option<StoredEvidence>> {
         let envelope = evidence_entity::Entity::find_by_id(id)
             .one(&self.database)
@@ -371,6 +447,22 @@ impl EvidenceStore {
 
 pub fn validate(evidence: &Evidence) -> Result<()> {
     evidence.validate().map_err(anyhow::Error::msg)
+}
+
+fn normalize_references(references: Vec<String>) -> Vec<String> {
+    let mut references = references
+        .into_iter()
+        .map(|reference| {
+            reference
+                .rsplit('/')
+                .next()
+                .unwrap_or(&reference)
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    references.sort();
+    references.dedup();
+    references
 }
 
 #[cfg(test)]
