@@ -10,7 +10,10 @@ use claims::ClaimKind;
 use clap::{Parser, Subcommand};
 use client::Host;
 use serde::Serialize;
-use shared::{Evidence, EvidenceList, EvidenceReceipt};
+use shared::{
+    CommitmentReceipt, CommitmentRequest, Evidence, EvidenceList, EvidenceReceipt, EvidenceReveal,
+    RoundPhase, RoundStatus, evidence_commitment, generate_nonce,
+};
 
 #[derive(Parser)]
 #[command(name = "reproductive-nix-cache")]
@@ -57,7 +60,9 @@ enum Command {
 struct BuildResult {
     evidence: Evidence,
     cache: Option<CacheUpload>,
+    commitment: CommitmentReceipt,
     receipt: EvidenceReceipt,
+    round: RoundStatus,
     /// Uninterpreted evidence returned by the registry.
     facts: EvidenceList,
     /// Calculated locally from `facts`; it is never supplied by the registry.
@@ -114,19 +119,52 @@ async fn main() -> Result<()> {
                 None
             };
             let registry = client::RegistryClient::new(&server)?;
-            let receipt = registry.submit(&evidence).await?;
             let derivation_path = evidence
                 .build_claim()
                 .context("generated evidence has no build claim")?
                 .derivation_path
                 .clone();
-            let facts = registry.facts(&derivation_path).await?;
+            let nonce = generate_nonce().map_err(anyhow::Error::msg)?;
+            let digest = evidence_commitment(&evidence, &nonce).map_err(anyhow::Error::msg)?;
+            let commitment = registry
+                .commit(&CommitmentRequest {
+                    builder_id: evidence.builder_id.clone(),
+                    derivation_path,
+                    digest,
+                })
+                .await?;
+            let round_id = commitment.round.id;
+            let mut round = commitment.round.clone();
+            while round.phase == RoundPhase::Committing {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                round = registry.round_status(round_id).await?;
+            }
+            if round.phase != RoundPhase::Revealing {
+                anyhow::bail!("commit-reveal round closed before this evidence was revealed");
+            }
+            let receipt = registry
+                .reveal(&EvidenceReveal {
+                    round_id,
+                    nonce,
+                    evidence: evidence.clone(),
+                })
+                .await?;
+            loop {
+                round = registry.round_status(round_id).await?;
+                if round.phase.is_closed() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            let facts = registry.round_facts(round_id).await?;
             let trust = trust::calculate_trust(&facts);
 
             let result = BuildResult {
                 evidence,
                 cache,
+                commitment,
                 receipt,
+                round,
                 facts,
                 trust,
             };

@@ -1,3 +1,87 @@
+pub mod round {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "commit_reveal_rounds")]
+    pub struct Model {
+        #[sea_orm(primary_key)]
+        pub id: i64,
+        pub derivation_path: String,
+        pub started_at: DateTimeUtc,
+        pub commit_deadline: DateTimeUtc,
+        pub reveal_started_at: Option<DateTimeUtc>,
+        pub reveal_deadline: Option<DateTimeUtc>,
+        pub closed_at: Option<DateTimeUtc>,
+        pub expired: bool,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {
+        #[sea_orm(has_many = "super::commitment::Entity")]
+        Commitment,
+    }
+
+    impl Related<super::commitment::Entity> for Entity {
+        fn to() -> RelationDef {
+            Relation::Commitment.def()
+        }
+    }
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod commitment {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "evidence_commitments")]
+    pub struct Model {
+        #[sea_orm(primary_key)]
+        pub id: i64,
+        pub round_id: i64,
+        pub builder_id: String,
+        pub digest: String,
+        pub committed_at: DateTimeUtc,
+        pub nonce: Option<String>,
+        pub evidence_id: Option<i64>,
+        pub revealed_at: Option<DateTimeUtc>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {
+        #[sea_orm(
+            belongs_to = "super::round::Entity",
+            from = "Column::RoundId",
+            to = "super::round::Column::Id",
+            on_update = "Cascade",
+            on_delete = "Cascade"
+        )]
+        Round,
+        #[sea_orm(
+            belongs_to = "super::evidence::Entity",
+            from = "Column::EvidenceId",
+            to = "super::evidence::Column::Id",
+            on_update = "Cascade",
+            on_delete = "SetNull"
+        )]
+        Evidence,
+    }
+
+    impl Related<super::round::Entity> for Entity {
+        fn to() -> RelationDef {
+            Relation::Round.def()
+        }
+    }
+
+    impl Related<super::evidence::Entity> for Entity {
+        fn to() -> RelationDef {
+            Relation::Evidence.def()
+        }
+    }
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
 pub mod evidence {
     use sea_orm::entity::prelude::*;
 

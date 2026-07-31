@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
 use reqwest::Client;
-use shared::{Evidence, EvidenceList, EvidenceReceipt};
+use shared::{
+    CommitmentReceipt, CommitmentRequest, EvidenceList, EvidenceReceipt, EvidenceReveal,
+    RoundStatus,
+};
 use std::{
     net::{IpAddr, SocketAddr},
     str::FromStr,
@@ -74,32 +77,106 @@ impl RegistryClient {
         })
     }
 
-    pub async fn submit(&self, evidence: &Evidence) -> Result<EvidenceReceipt> {
-        self.client
-            .post(self.endpoint("/v1/evidence")?)
-            .json(evidence)
-            .send()
-            .await
-            .context("failed to submit evidence to registry")?
-            .error_for_status()
-            .context("registry rejected evidence")?
-            .json()
-            .await
-            .context("registry returned invalid evidence receipt")
+    pub async fn commit(&self, commitment: &CommitmentRequest) -> Result<CommitmentReceipt> {
+        self.send_with_retry(
+            || {
+                Ok(self
+                    .client
+                    .post(self.endpoint("/v1/evidence/commitments")?)
+                    .json(commitment))
+            },
+            "submit commitment to registry",
+        )
+        .await?
+        .error_for_status()
+        .context("registry rejected commitment")?
+        .json()
+        .await
+        .context("registry returned invalid commitment receipt")
     }
 
-    pub async fn facts(&self, derivation_path: &str) -> Result<EvidenceList> {
-        self.client
-            .get(self.endpoint("/v1/evidence")?)
-            .query(&[("derivation_path", derivation_path)])
-            .send()
-            .await
-            .context("failed to fetch registry evidence")?
-            .error_for_status()
-            .context("registry rejected evidence lookup")?
-            .json()
-            .await
-            .context("registry returned invalid evidence facts")
+    pub async fn round_status(&self, round_id: i64) -> Result<RoundStatus> {
+        self.send_with_retry(
+            || {
+                Ok(self
+                    .client
+                    .get(self.endpoint(&format!("/v1/evidence/rounds/{round_id}"))?))
+            },
+            "fetch commit-reveal round",
+        )
+        .await?
+        .error_for_status()
+        .context("registry rejected round lookup")?
+        .json()
+        .await
+        .context("registry returned invalid round status")
+    }
+
+    pub async fn reveal(&self, reveal: &EvidenceReveal) -> Result<EvidenceReceipt> {
+        self.send_with_retry(
+            || {
+                Ok(self
+                    .client
+                    .post(self.endpoint("/v1/evidence/reveals")?)
+                    .json(reveal))
+            },
+            "reveal evidence to registry",
+        )
+        .await?
+        .error_for_status()
+        .context("registry rejected evidence reveal")?
+        .json()
+        .await
+        .context("registry returned invalid evidence receipt")
+    }
+
+    pub async fn round_facts(&self, round_id: i64) -> Result<EvidenceList> {
+        self.send_with_retry(
+            || {
+                Ok(self
+                    .client
+                    .get(self.endpoint("/v1/evidence")?)
+                    .query(&[("round_id", round_id)]))
+            },
+            "fetch registry evidence",
+        )
+        .await?
+        .error_for_status()
+        .context("registry rejected evidence lookup")?
+        .json()
+        .await
+        .context("registry returned invalid evidence facts")
+    }
+
+    async fn send_with_retry<F>(
+        &self,
+        mut request: F,
+        action: &'static str,
+    ) -> Result<reqwest::Response>
+    where
+        F: FnMut() -> Result<reqwest::RequestBuilder>,
+    {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut delay = std::time::Duration::from_millis(250);
+        loop {
+            match request()?.send().await {
+                Ok(response)
+                    if !response.status().is_server_error()
+                        || tokio::time::Instant::now() >= deadline =>
+                {
+                    return Ok(response);
+                }
+                Ok(_) => {}
+                Err(error) if tokio::time::Instant::now() < deadline => {
+                    let _ = error;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| format!("failed to {action}"));
+                }
+            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(std::time::Duration::from_secs(2));
+        }
     }
 
     fn endpoint(&self, path: &str) -> Result<reqwest::Url> {

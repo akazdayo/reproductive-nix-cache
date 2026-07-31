@@ -138,6 +138,7 @@ mod tests {
                 .enumerate()
                 .map(|(index, (builder_id, nar_hash))| StoredEvidence {
                     id: index as i64,
+                    round_id: Some(1),
                     evidence: Evidence {
                         schema_version: EVIDENCE_SCHEMA_VERSION,
                         builder_id: (*builder_id).into(),
