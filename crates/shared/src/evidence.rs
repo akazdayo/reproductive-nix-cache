@@ -228,6 +228,9 @@ pub struct LogClaim {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredEvidence {
     pub id: i64,
+    /// The commit-reveal round that admitted this evidence. Legacy records
+    /// created before commit-reveal have no round.
+    pub round_id: Option<i64>,
     #[serde(flatten)]
     pub evidence: Evidence,
     pub received_at: DateTime<Utc>,

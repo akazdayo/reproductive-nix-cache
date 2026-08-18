@@ -1,4 +1,4 @@
-use crate::store::{EvidenceStore, OutputFingerprint};
+use crate::store::{EvidenceStore, OutputFingerprint, RoundConfig};
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use object_store::{
@@ -74,6 +74,7 @@ impl BinaryCache {
         &self,
         evidence: &EvidenceStore,
         key: &str,
+        round_config: RoundConfig,
     ) -> Result<Option<Vec<u8>>> {
         let Some(store_hash) = key.strip_suffix(".narinfo").filter(|hash| valid_hash(hash)) else {
             return Ok(None);
@@ -90,7 +91,7 @@ impl BinaryCache {
             return Ok(None);
         }
         let Some(consensus) = evidence
-            .output_consensus(&narinfo.store_path, self.minimum_builders)
+            .output_consensus(&narinfo.store_path, self.minimum_builders, round_config)
             .await?
         else {
             return Ok(None);
