@@ -1904,9 +1904,12 @@ dependencies = [
 name = "shared"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "chrono",
+ "getrandom 0.4.3",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

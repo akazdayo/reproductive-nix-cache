@@ -21,6 +21,12 @@ pub fn format_build_summary(result: &BuildResult) -> String {
         result.receipt.evidence.id
     )
     .unwrap();
+    writeln!(
+        summary,
+        "Round         #{} ({:?}, {}/{} revealed)",
+        result.round.id, result.round.phase, result.round.reveal_count, result.round.commit_count
+    )
+    .unwrap();
     writeln!(summary, "Derivation    {}", trust.derivation_path).unwrap();
 
     if let Some(build) = evidence.build_claim() {
@@ -111,7 +117,8 @@ mod tests {
     use chrono::Utc;
     use shared::{
         BuildClaim, BuildOutput, BuildStatement, Claim, EVIDENCE_SCHEMA_VERSION, Evidence,
-        EvidenceList, EvidenceReceipt, Package, ResolvedSource, StoredEvidence,
+        EvidenceList, EvidenceReceipt, Package, ResolvedSource, RoundPhase, RoundStatus,
+        StoredEvidence,
     };
 
     fn result() -> BuildResult {
@@ -148,6 +155,7 @@ mod tests {
         };
         let stored = StoredEvidence {
             id: 42,
+            round_id: Some(7),
             evidence: evidence.clone(),
             received_at: Utc::now(),
         };
@@ -156,12 +164,26 @@ mod tests {
             nar_hash: "sha256-output".into(),
         }];
 
+        let round = RoundStatus {
+            id: 7,
+            derivation_path: "/nix/store/hello.drv".into(),
+            phase: RoundPhase::Completed,
+            commit_count: 1,
+            reveal_count: 1,
+            commit_deadline: Utc::now(),
+            reveal_deadline: Some(Utc::now()),
+        };
         BuildResult {
             evidence,
             receipt: EvidenceReceipt {
                 inserted: true,
                 evidence: stored.clone(),
             },
+            commitment: shared::CommitmentReceipt {
+                inserted: true,
+                round: round.clone(),
+            },
+            round,
             facts: EvidenceList {
                 derivation_path: "/nix/store/hello.drv".into(),
                 evidences: vec![stored],

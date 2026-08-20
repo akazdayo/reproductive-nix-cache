@@ -1,4 +1,4 @@
-use crate::store::{EvidenceStore, OutputFingerprint};
+use crate::store::{EvidenceStore, OutputFingerprint, RoundConfig};
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::{Client, Response, StatusCode, Url, redirect::Policy};
@@ -51,6 +51,7 @@ impl BinaryCache {
         &self,
         evidence: &EvidenceStore,
         key: &str,
+        round_config: RoundConfig,
     ) -> Result<Option<ApprovedNarInfo>> {
         let Some(store_hash) = key.strip_suffix(".narinfo").filter(|hash| valid_hash(hash)) else {
             return Ok(None);
@@ -63,7 +64,7 @@ impl BinaryCache {
             return Ok(None);
         }
         let Some(consensus) = evidence
-            .output_consensus(&narinfo.store_path, self.minimum_builders)
+            .output_consensus(&narinfo.store_path, self.minimum_builders, round_config)
             .await?
         else {
             return Ok(None);
@@ -84,8 +85,12 @@ impl BinaryCache {
         &self,
         evidence: &EvidenceStore,
         store_hash: &str,
+        round_config: RoundConfig,
     ) -> Result<Option<Response>> {
-        let Some(approved) = self.approved_by_hash(evidence, store_hash).await? else {
+        let Some(approved) = self
+            .approved_by_hash(evidence, store_hash, round_config)
+            .await?
+        else {
             return Ok(None);
         };
         self.send_nar(self.client.get(approved.upstream_nar_url))
@@ -96,8 +101,12 @@ impl BinaryCache {
         &self,
         evidence: &EvidenceStore,
         store_hash: &str,
+        round_config: RoundConfig,
     ) -> Result<Option<Response>> {
-        let Some(approved) = self.approved_by_hash(evidence, store_hash).await? else {
+        let Some(approved) = self
+            .approved_by_hash(evidence, store_hash, round_config)
+            .await?
+        else {
             return Ok(None);
         };
         self.send_nar(self.client.head(approved.upstream_nar_url))
@@ -108,11 +117,12 @@ impl BinaryCache {
         &self,
         evidence: &EvidenceStore,
         store_hash: &str,
+        round_config: RoundConfig,
     ) -> Result<Option<ApprovedNarInfo>> {
         if !valid_hash(store_hash) {
             return Ok(None);
         }
-        self.approved_narinfo(evidence, &format!("{store_hash}.narinfo"))
+        self.approved_narinfo(evidence, &format!("{store_hash}.narinfo"), round_config)
             .await
     }
 

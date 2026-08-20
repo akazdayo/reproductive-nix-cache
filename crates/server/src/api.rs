@@ -1,6 +1,6 @@
 use crate::{
     binary_cache::{BinaryCache, CACHE_INFO},
-    store::{EvidenceStore, validate},
+    store::{EvidenceStore, ProtocolError, RoundConfig},
 };
 use axum::{
     Json, Router,
@@ -11,12 +11,16 @@ use axum::{
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
-use shared::{Evidence, EvidenceList};
+use shared::{
+    CommitmentReceipt, CommitmentRequest, EvidenceList, EvidenceReceipt, EvidenceReveal,
+    RoundStatus,
+};
 
 #[derive(Clone)]
 pub struct AppState {
     store: EvidenceStore,
     binary_cache: Option<BinaryCache>,
+    round_config: RoundConfig,
 }
 
 impl AppState {
@@ -24,11 +28,17 @@ impl AppState {
         Self {
             store,
             binary_cache: None,
+            round_config: RoundConfig::default(),
         }
     }
 
     pub fn with_binary_cache(mut self, binary_cache: BinaryCache) -> Self {
         self.binary_cache = Some(binary_cache);
+        self
+    }
+
+    pub fn with_round_config(mut self, round_config: RoundConfig) -> Self {
+        self.round_config = round_config;
         self
     }
 
@@ -41,12 +51,13 @@ impl AppState {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(health))
+        .route("/v1/evidence", get(list_evidence))
+        .route("/v1/evidence/commitments", post(commit_evidence))
         .route(
-            "/v1/evidence",
-            post(submit_evidence)
-                .get(list_evidence)
-                .layer(DefaultBodyLimit::disable()),
+            "/v1/evidence/reveals",
+            post(reveal_evidence).layer(DefaultBodyLimit::disable()),
         )
+        .route("/v1/evidence/rounds/{round_id}", get(round_status))
         .route(
             "/nix-cache-info",
             get(binary_cache_info).head(binary_cache_info_head),
@@ -60,34 +71,76 @@ async fn health() -> &'static str {
     "ok"
 }
 
-async fn submit_evidence(
+async fn commit_evidence(
     State(state): State<AppState>,
-    Json(evidence): Json<Evidence>,
-) -> ApiResult<impl IntoResponse> {
-    validate(&evidence).map_err(ApiError::bad_request)?;
+    Json(commitment): Json<CommitmentRequest>,
+) -> ApiResult<(StatusCode, Json<CommitmentReceipt>)> {
     let receipt = state
         .store
-        .insert(&evidence)
+        .commit(&commitment, state.round_config)
         .await
-        .map_err(ApiError::internal)?;
+        .map_err(ApiError::protocol)?;
     let status = if receipt.inserted {
         StatusCode::CREATED
     } else {
         StatusCode::OK
     };
+    Ok((status, Json(receipt)))
+}
 
+async fn round_status(
+    State(state): State<AppState>,
+    Path(round_id): Path<i64>,
+) -> ApiResult<Json<RoundStatus>> {
+    state
+        .store
+        .round_status(round_id, state.round_config)
+        .await
+        .map(Json)
+        .map_err(ApiError::protocol)
+}
+
+async fn reveal_evidence(
+    State(state): State<AppState>,
+    Json(reveal): Json<EvidenceReveal>,
+) -> ApiResult<(StatusCode, Json<EvidenceReceipt>)> {
+    let receipt = state
+        .store
+        .reveal(&reveal, state.round_config)
+        .await
+        .map_err(ApiError::protocol)?;
+    let status = if receipt.inserted {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
     Ok((status, Json(receipt)))
 }
 
 #[derive(Debug, Deserialize)]
 struct EvidenceQuery {
     derivation_path: Option<String>,
+    round_id: Option<i64>,
 }
 
 async fn list_evidence(
     State(state): State<AppState>,
     Query(query): Query<EvidenceQuery>,
 ) -> ApiResult<Json<EvidenceList>> {
+    if let Some(round_id) = query.round_id {
+        if query.derivation_path.is_some() {
+            return Err(ApiError::bad_request(
+                "provide either round_id or derivation_path, not both",
+            ));
+        }
+        return state
+            .store
+            .list_round(round_id)
+            .await
+            .map_err(ApiError::internal)?
+            .map(Json)
+            .ok_or_else(|| ApiError::not_found("round was not found"));
+    }
     let derivation_path = query
         .derivation_path
         .filter(|value| !value.trim().is_empty())
@@ -136,7 +189,10 @@ async fn narinfo_response(state: &AppState, key: &str, head_only: bool) -> Respo
     let Some(cache) = &state.binary_cache else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    match cache.approved_narinfo(&state.store, key).await {
+    match cache
+        .approved_narinfo(&state.store, key, state.round_config)
+        .await
+    {
         Ok(Some(approved)) => {
             let length = approved.bytes.len();
             Response::builder()
@@ -159,7 +215,10 @@ async fn get_nar(State(state): State<AppState>, Path(store_hash): Path<String>) 
     let Some(cache) = &state.binary_cache else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    match cache.get_nar(&state.store, &store_hash).await {
+    match cache
+        .get_nar(&state.store, &store_hash, state.round_config)
+        .await
+    {
         Ok(Some(result)) => {
             let length = result.headers().get(header::CONTENT_LENGTH).cloned();
             let content_type = result.headers().get(header::CONTENT_TYPE).cloned();
@@ -183,7 +242,10 @@ async fn head_nar(State(state): State<AppState>, Path(store_hash): Path<String>)
     let Some(cache) = &state.binary_cache else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    match cache.head_nar(&state.store, &store_hash).await {
+    match cache
+        .head_nar(&state.store, &store_hash, state.round_config)
+        .await
+    {
         Ok(Some(result)) => {
             let mut response = Response::builder().status(StatusCode::OK);
             if let Some(length) = result.headers().get(header::CONTENT_LENGTH) {
@@ -227,6 +289,27 @@ impl ApiError {
             message: error.to_string(),
         }
     }
+
+    fn not_found(error: impl std::fmt::Display) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: error.to_string(),
+        }
+    }
+
+    fn protocol(error: ProtocolError) -> Self {
+        let status = match error {
+            ProtocolError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            ProtocolError::NotFound(_) => StatusCode::NOT_FOUND,
+            ProtocolError::Conflict(_) => StatusCode::CONFLICT,
+            ProtocolError::Gone(_) => StatusCode::GONE,
+            ProtocolError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        Self {
+            status,
+            message: error.to_string(),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -256,7 +339,8 @@ mod tests {
     use chrono::{Duration, Utc};
     use shared::{
         BuildClaim, BuildOutput, BuildStatement, Claim, EVIDENCE_SCHEMA_VERSION, Evidence,
-        EvidenceReceipt, LogClaim, Package, ResolvedSource,
+        EvidenceReceipt, EvidenceReveal, LogClaim, Package, ResolvedSource, evidence_commitment,
+        generate_nonce,
     };
     use tokio::net::TcpListener;
     use tower::ServiceExt;
@@ -381,17 +465,106 @@ mod tests {
         reqwest::Url::parse(&format!("http://{address}/")).unwrap()
     }
 
+    fn test_round_config(minimum_builders: usize) -> RoundConfig {
+        RoundConfig {
+            minimum_builders,
+            commit_window: Duration::seconds(60),
+            reveal_window: Duration::seconds(60),
+        }
+    }
+
+    fn commitment_for(evidence: &Evidence, nonce: &str) -> CommitmentRequest {
+        CommitmentRequest {
+            builder_id: evidence.builder_id.clone(),
+            derivation_path: evidence
+                .build_claim()
+                .map(|claim| claim.derivation_path.clone())
+                .unwrap_or_else(|| "/nix/store/example-hello.drv".into()),
+            digest: evidence_commitment(evidence, nonce).unwrap(),
+        }
+    }
+
+    async fn commit_via_api(app: &Router, evidence: &Evidence) -> (i64, String) {
+        let nonce = generate_nonce().unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/evidence/commitments")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&commitment_for(evidence, &nonce)).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let receipt: CommitmentReceipt =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        (receipt.round.id, nonce)
+    }
+
+    async fn reveal_via_api(
+        app: &Router,
+        round_id: i64,
+        nonce: &str,
+        evidence: &Evidence,
+    ) -> Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/evidence/reveals")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&EvidenceReveal {
+                            round_id,
+                            nonce: nonce.into(),
+                            evidence: evidence.clone(),
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
     async fn cache_app_with_narinfo(
         minimum_builders: usize,
         evidence: Vec<Evidence>,
         contents: String,
     ) -> Router {
         let store = EvidenceStore::in_memory().await.unwrap();
-        for item in evidence {
-            store.insert(&item).await.unwrap();
+        let round_config = test_round_config(evidence.len().max(1));
+        let mut reveals = Vec::new();
+        for item in &evidence {
+            let nonce = generate_nonce().unwrap();
+            let receipt = store
+                .commit(&commitment_for(item, &nonce), round_config)
+                .await
+                .unwrap();
+            reveals.push((receipt.round.id, nonce, item.clone()));
+        }
+        for (round_id, nonce, evidence) in reveals {
+            store
+                .reveal(
+                    &EvidenceReveal {
+                        round_id,
+                        nonce,
+                        evidence,
+                    },
+                    round_config,
+                )
+                .await
+                .unwrap();
         }
         let upstream = spawn_upstream(contents).await;
         let state = AppState::new(store)
+            .with_round_config(round_config)
             .with_binary_cache(BinaryCache::for_tests(upstream, minimum_builders));
         router(state)
     }
@@ -402,16 +575,15 @@ mod tests {
 
     #[tokio::test]
     async fn api_persists_and_returns_raw_evidence_facts() {
-        let app = router(AppState::in_memory().await.unwrap());
-        let request = Request::builder()
-            .method("POST")
-            .uri("/v1/evidence")
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&evidence("builder-a", "sha256-out")).unwrap(),
-            ))
-            .unwrap();
-        let response = app.clone().oneshot(request).await.unwrap();
+        let app = router(
+            AppState::in_memory()
+                .await
+                .unwrap()
+                .with_round_config(test_round_config(1)),
+        );
+        let evidence = evidence("builder-a", "sha256-out");
+        let (round_id, nonce) = commit_via_api(&app, &evidence).await;
+        let response = reveal_via_api(&app, round_id, &nonce, &evidence).await;
         assert_eq!(response.status(), StatusCode::CREATED);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let receipt_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -420,22 +592,15 @@ mod tests {
         let receipt: EvidenceReceipt = serde_json::from_slice(&body).unwrap();
         assert!(receipt.inserted);
 
-        let duplicate = Request::builder()
-            .method("POST")
-            .uri("/v1/evidence")
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&evidence("builder-a", "sha256-out")).unwrap(),
-            ))
-            .unwrap();
-        let response = app.clone().oneshot(duplicate).await.unwrap();
-        assert_eq!(response.status(), StatusCode::CREATED);
+        let response = reveal_via_api(&app, round_id, &nonce, &evidence).await;
+        assert_eq!(response.status(), StatusCode::OK);
         let duplicate_receipt: EvidenceReceipt =
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        assert!(duplicate_receipt.inserted);
+        assert!(!duplicate_receipt.inserted);
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/v1/evidence?derivation_path=%2Fnix%2Fstore%2Fexample-hello.drv")
@@ -450,7 +615,8 @@ mod tests {
         assert!(facts_json.get("score").is_none());
         assert!(facts_json.get("trust").is_none());
         let facts: EvidenceList = serde_json::from_slice(&body).unwrap();
-        assert_eq!(facts.evidences.len(), 2);
+        assert_eq!(facts.evidences.len(), 1);
+        assert_eq!(facts.evidences[0].round_id, Some(round_id));
         assert_eq!(facts.evidences[0].evidence.builder_id, "builder-a");
         assert_eq!(
             facts.evidences[0]
@@ -462,66 +628,118 @@ mod tests {
                 .nar_hash,
             "sha256-out"
         );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/evidence?round_id={round_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let round_facts: EvidenceList =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(round_facts.evidences.len(), 1);
+        assert_eq!(round_facts.evidences[0].round_id, Some(round_id));
     }
 
     #[tokio::test]
     async fn api_rejects_missing_or_multiple_build_claims() {
-        let app = router(AppState::in_memory().await.unwrap());
         let mut missing = evidence("builder-a", "sha256-out");
         missing
             .claims
             .retain(|claim| !matches!(claim, Claim::Build(_)));
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/evidence")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(serde_json::to_vec(&missing).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let app = router(
+            AppState::in_memory()
+                .await
+                .unwrap()
+                .with_round_config(test_round_config(1)),
+        );
+        let (round_id, nonce) = commit_via_api(&app, &missing).await;
+        let response = reveal_via_api(&app, round_id, &nonce, &missing).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         let mut multiple = evidence("builder-a", "sha256-out");
         multiple.claims.push(multiple.claims[0].clone());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/evidence")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(serde_json::to_vec(&multiple).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let app = router(
+            AppState::in_memory()
+                .await
+                .unwrap()
+                .with_round_config(test_round_config(1)),
+        );
+        let (round_id, nonce) = commit_via_api(&app, &multiple).await;
+        let response = reveal_via_api(&app, round_id, &nonce, &multiple).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
     async fn api_accepts_log_claim_larger_than_two_megabytes() {
-        let app = router(AppState::in_memory().await.unwrap());
+        let app = router(
+            AppState::in_memory()
+                .await
+                .unwrap()
+                .with_round_config(test_round_config(1)),
+        );
         let mut evidence = evidence("builder-a", "sha256-out");
         let Claim::Log(log) = &mut evidence.claims[1] else {
             unreachable!()
         };
         log.stdout = "x".repeat(2 * 1024 * 1024 + 1);
 
-        let response = app
+        let (round_id, nonce) = commit_via_api(&app, &evidence).await;
+        let response = reveal_via_api(&app, round_id, &nonce, &evidence).await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn api_hides_evidence_until_reveal_phase_and_rejects_tampering() {
+        let app = router(
+            AppState::in_memory()
+                .await
+                .unwrap()
+                .with_round_config(test_round_config(2)),
+        );
+        let first = evidence("builder-a", "sha256-one");
+        let (round_id, first_nonce) = commit_via_api(&app, &first).await;
+        let early = reveal_via_api(&app, round_id, &first_nonce, &first).await;
+        assert_eq!(early.status(), StatusCode::CONFLICT);
+
+        let second = evidence("builder-b", "sha256-one");
+        let (second_round_id, second_nonce) = commit_via_api(&app, &second).await;
+        assert_eq!(second_round_id, round_id);
+        let mut tampered = second;
+        tampered.package.name = "tampered".into();
+        let response = reveal_via_api(&app, round_id, &second_nonce, &tampered).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let history = app
+            .clone()
             .oneshot(
                 Request::builder()
-                    .method("POST")
-                    .uri("/v1/evidence")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(serde_json::to_vec(&evidence).unwrap()))
+                    .uri("/v1/evidence?derivation_path=%2Fnix%2Fstore%2Fexample-hello.drv")
+                    .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::CREATED);
+        let facts: EvidenceList =
+            serde_json::from_slice(&to_bytes(history.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(facts.evidences.is_empty());
+
+        let direct = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/evidence")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(direct.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 
     #[tokio::test]
