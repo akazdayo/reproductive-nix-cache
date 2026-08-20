@@ -13,9 +13,9 @@ pub struct Cli {
     #[arg(long)]
     pub database: Option<PathBuf>,
 
-    /// S3 store containing the Nix binary cache objects
-    #[arg(long, env = "NIX_CACHE_S3_URL")]
-    pub binary_cache: Option<String>,
+    /// HTTP(S) Nix binary cache used as the artifact upstream
+    #[arg(long, env = "NIX_CACHE_UPSTREAM_URL")]
+    pub upstream_cache: Option<String>,
 
     /// Distinct builders that must agree before a narinfo is published
     #[arg(long, env = "NIX_CACHE_MIN_BUILDERS", default_value_t = 2)]

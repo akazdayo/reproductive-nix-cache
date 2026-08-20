@@ -51,7 +51,7 @@ pub fn router(state: AppState) -> Router {
             "/nix-cache-info",
             get(binary_cache_info).head(binary_cache_info_head),
         )
-        .route("/nar/{*key}", get(get_nar).head(head_nar))
+        .route("/nar/{store_hash}", get(get_nar).head(head_nar))
         .route("/{key}", get(get_narinfo).head(head_narinfo))
         .with_state(state)
 }
@@ -137,8 +137,8 @@ async fn narinfo_response(state: &AppState, key: &str, head_only: bool) -> Respo
         return StatusCode::NOT_FOUND.into_response();
     };
     match cache.approved_narinfo(&state.store, key).await {
-        Ok(Some(bytes)) => {
-            let length = bytes.len();
+        Ok(Some(approved)) => {
+            let length = approved.bytes.len();
             Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "text/x-nix-narinfo")
@@ -146,47 +146,56 @@ async fn narinfo_response(state: &AppState, key: &str, head_only: bool) -> Respo
                 .body(if head_only {
                     Body::empty()
                 } else {
-                    Body::from(bytes)
+                    Body::from(approved.bytes)
                 })
                 .unwrap()
         }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(error) => ApiError::internal(error).into_response(),
+        Err(error) => ApiError::bad_gateway(error).into_response(),
     }
 }
 
-async fn get_nar(State(state): State<AppState>, Path(key): Path<String>) -> Response {
+async fn get_nar(State(state): State<AppState>, Path(store_hash): Path<String>) -> Response {
     let Some(cache) = &state.binary_cache else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    match cache.get_nar(&key).await {
+    match cache.get_nar(&state.store, &store_hash).await {
         Ok(Some(result)) => {
-            let length = result.meta.size;
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/x-nix-nar")
-                .header(header::CONTENT_LENGTH, length)
-                .body(Body::from_stream(result.into_stream()))
+            let length = result.headers().get(header::CONTENT_LENGTH).cloned();
+            let content_type = result.headers().get(header::CONTENT_TYPE).cloned();
+            let mut response = Response::builder().status(StatusCode::OK);
+            if let Some(length) = length {
+                response = response.header(header::CONTENT_LENGTH, length);
+            }
+            if let Some(content_type) = content_type {
+                response = response.header(header::CONTENT_TYPE, content_type);
+            }
+            response
+                .body(Body::from_stream(result.bytes_stream()))
                 .unwrap()
         }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(error) => ApiError::internal(error).into_response(),
+        Err(error) => ApiError::bad_gateway(error).into_response(),
     }
 }
 
-async fn head_nar(State(state): State<AppState>, Path(key): Path<String>) -> Response {
+async fn head_nar(State(state): State<AppState>, Path(store_hash): Path<String>) -> Response {
     let Some(cache) = &state.binary_cache else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    match cache.head_nar(&key).await {
-        Ok(Some(meta)) => Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/x-nix-nar")
-            .header(header::CONTENT_LENGTH, meta.size)
-            .body(Body::empty())
-            .unwrap(),
+    match cache.head_nar(&state.store, &store_hash).await {
+        Ok(Some(result)) => {
+            let mut response = Response::builder().status(StatusCode::OK);
+            if let Some(length) = result.headers().get(header::CONTENT_LENGTH) {
+                response = response.header(header::CONTENT_LENGTH, length);
+            }
+            if let Some(content_type) = result.headers().get(header::CONTENT_TYPE) {
+                response = response.header(header::CONTENT_TYPE, content_type);
+            }
+            response.body(Body::empty()).unwrap()
+        }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(error) => ApiError::internal(error).into_response(),
+        Err(error) => ApiError::bad_gateway(error).into_response(),
     }
 }
 
@@ -208,6 +217,13 @@ impl ApiError {
     fn internal(error: impl std::fmt::Display) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: error.to_string(),
+        }
+    }
+
+    fn bad_gateway(error: impl std::fmt::Display) -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
             message: error.to_string(),
         }
     }
@@ -238,12 +254,11 @@ mod tests {
         http::{Request, header},
     };
     use chrono::{Duration, Utc};
-    use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path as ObjectPath};
     use shared::{
         BuildClaim, BuildOutput, BuildStatement, Claim, EVIDENCE_SCHEMA_VERSION, Evidence,
         EvidenceReceipt, LogClaim, Package, ResolvedSource,
     };
-    use std::sync::Arc;
+    use tokio::net::TcpListener;
     use tower::ServiceExt;
 
     const CACHE_HASH: &str = "00000000000000000000000000000000";
@@ -326,26 +341,63 @@ mod tests {
         )
     }
 
-    async fn cache_app(
+    async fn spawn_upstream(narinfo: String) -> reqwest::Url {
+        let narinfo_route = narinfo.clone();
+        let upstream = Router::new()
+            .route(
+                "/{key}",
+                get(move |Path(key): Path<String>| {
+                    let narinfo = narinfo_route.clone();
+                    async move {
+                        if key == format!("{CACHE_HASH}.narinfo") {
+                            ([(header::CONTENT_TYPE, "text/x-nix-narinfo")], narinfo)
+                                .into_response()
+                        } else {
+                            StatusCode::NOT_FOUND.into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/nar/example.nar.xz",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "application/x-nix-nar")],
+                        "compressed nar",
+                    )
+                })
+                .head(|| async {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "application/x-nix-nar")
+                        .header(header::CONTENT_LENGTH, 14)
+                        .body(Body::empty())
+                        .unwrap()
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        reqwest::Url::parse(&format!("http://{address}/")).unwrap()
+    }
+
+    async fn cache_app_with_narinfo(
         minimum_builders: usize,
         evidence: Vec<Evidence>,
-    ) -> (Router, Arc<InMemory>) {
+        contents: String,
+    ) -> Router {
         let store = EvidenceStore::in_memory().await.unwrap();
         for item in evidence {
             store.insert(&item).await.unwrap();
         }
-        let objects = Arc::new(InMemory::new());
-        objects
-            .put(
-                &ObjectPath::from(format!("{CACHE_HASH}.narinfo")),
-                narinfo(CACHE_NAR_HASH_NIX32).into(),
-            )
-            .await
-            .unwrap();
-        let object_store: Arc<dyn ObjectStore> = objects.clone();
+        let upstream = spawn_upstream(contents).await;
         let state = AppState::new(store)
-            .with_binary_cache(BinaryCache::for_tests(object_store, minimum_builders));
-        (router(state), objects)
+            .with_binary_cache(BinaryCache::for_tests(upstream, minimum_builders));
+        router(state)
+    }
+
+    async fn cache_app(minimum_builders: usize, evidence: Vec<Evidence>) -> Router {
+        cache_app_with_narinfo(minimum_builders, evidence, narinfo(CACHE_NAR_HASH_NIX32)).await
     }
 
     #[tokio::test]
@@ -474,8 +526,7 @@ mod tests {
 
     #[tokio::test]
     async fn cache_publishes_narinfo_only_after_builder_consensus() {
-        let (unapproved, _) =
-            cache_app(2, vec![cache_evidence("builder-a", CACHE_NAR_HASH_SRI)]).await;
+        let unapproved = cache_app(2, vec![cache_evidence("builder-a", CACHE_NAR_HASH_SRI)]).await;
         let request = Request::builder()
             .uri(format!("/{CACHE_HASH}.narinfo"))
             .body(Body::empty())
@@ -485,7 +536,7 @@ mod tests {
             StatusCode::NOT_FOUND
         );
 
-        let (approved, _) = cache_app(
+        let approved = cache_app(
             2,
             vec![
                 cache_evidence("builder-a", CACHE_NAR_HASH_SRI),
@@ -506,12 +557,13 @@ mod tests {
         assert_eq!(
             to_bytes(response.into_body(), usize::MAX).await.unwrap(),
             narinfo(CACHE_NAR_HASH_NIX32)
+                .replace("URL: nar/example.nar.xz", &format!("URL: nar/{CACHE_HASH}"),)
         );
     }
 
     #[tokio::test]
     async fn cache_rejects_narinfo_that_differs_from_consensus() {
-        let (app, _) = cache_app(
+        let app = cache_app(
             2,
             vec![
                 cache_evidence("builder-a", OTHER_NAR_HASH_SRI),
@@ -532,21 +584,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_streams_nars_and_supports_head() {
-        let (app, objects) = cache_app(1, vec![]).await;
-        objects
-            .put(
-                &ObjectPath::from("nar/example.nar.xz"),
-                "compressed nar".into(),
+    async fn cache_hides_tied_variants_and_missing_upstream_entries() {
+        let app = cache_app(
+            1,
+            vec![
+                cache_evidence("builder-a", CACHE_NAR_HASH_SRI),
+                cache_evidence("builder-b", OTHER_NAR_HASH_SRI),
+            ],
+        )
+        .await;
+        let tied = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/{CACHE_HASH}.narinfo"))
+                    .body(Body::empty())
+                    .unwrap(),
             )
             .await
             .unwrap();
+        assert_eq!(tied.status(), StatusCode::NOT_FOUND);
+
+        let missing = app
+            .oneshot(
+                Request::builder()
+                    .uri("/11111111111111111111111111111111.narinfo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn cache_streams_nars_and_supports_head() {
+        let app = cache_app(1, vec![cache_evidence("builder-a", CACHE_NAR_HASH_SRI)]).await;
 
         let response = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/nar/example.nar.xz")
+                    .uri(format!("/nar/{CACHE_HASH}"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -559,10 +638,11 @@ mod tests {
         );
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("HEAD")
-                    .uri("/nar/example.nar.xz")
+                    .uri(format!("/nar/{CACHE_HASH}"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -576,6 +656,117 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/nar/example.nar.xz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn cache_returns_bad_gateway_for_invalid_or_unsafe_narinfo() {
+        let approved = vec![cache_evidence("builder-a", CACHE_NAR_HASH_SRI)];
+        let invalid = cache_app_with_narinfo(
+            1,
+            approved.clone(),
+            narinfo(CACHE_NAR_HASH_NIX32).replace("NarSize: 1234", "NarSize: invalid"),
+        )
+        .await;
+        let response = invalid
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/{CACHE_HASH}.narinfo"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        let unsafe_url = cache_app_with_narinfo(
+            1,
+            approved,
+            narinfo(CACHE_NAR_HASH_NIX32).replace(
+                "URL: nar/example.nar.xz",
+                "URL: https://evil.example/example.nar.xz",
+            ),
+        )
+        .await;
+        let response = unsafe_url
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/{CACHE_HASH}.narinfo"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn cache_returns_not_found_when_an_approved_nar_is_missing_upstream() {
+        let app = cache_app_with_narinfo(
+            1,
+            vec![cache_evidence("builder-a", CACHE_NAR_HASH_SRI)],
+            narinfo(CACHE_NAR_HASH_NIX32)
+                .replace("URL: nar/example.nar.xz", "URL: nar/missing.nar.xz"),
+        )
+        .await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/nar/{CACHE_HASH}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn cache_does_not_follow_upstream_redirects() {
+        let upstream = Router::new().route(
+            &format!("/{CACHE_HASH}.narinfo"),
+            get(|| async {
+                Response::builder()
+                    .status(StatusCode::TEMPORARY_REDIRECT)
+                    .header(header::LOCATION, "/redirected.narinfo")
+                    .body(Body::empty())
+                    .unwrap()
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+        let store = EvidenceStore::in_memory().await.unwrap();
+        store
+            .insert(&cache_evidence("builder-a", CACHE_NAR_HASH_SRI))
+            .await
+            .unwrap();
+        let cache = BinaryCache::for_tests(
+            reqwest::Url::parse(&format!("http://{address}/")).unwrap(),
+            1,
+        );
+        let app = router(AppState::new(store).with_binary_cache(cache));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/{CACHE_HASH}.narinfo"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]
@@ -592,7 +783,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
-        let (enabled, _) = cache_app(1, vec![]).await;
+        let enabled = cache_app(1, vec![]).await;
         let response = enabled
             .oneshot(
                 Request::builder()

@@ -37,13 +37,6 @@ enum Command {
         /// Allow Nix to obtain build outputs from substituters
         #[arg(long)]
         substitute: bool,
-        /// S3 binary cache receiving the build outputs
-        #[arg(
-            long,
-            env = "NIX_CACHE_S3_URL",
-            value_parser = parse_binary_cache_url
-        )]
-        binary_cache: Option<String>,
         /// Additional claim to include; the build claim is always included
         #[arg(long = "claim", value_enum)]
         claims: Vec<ClaimKind>,
@@ -56,18 +49,11 @@ enum Command {
 #[derive(Serialize)]
 struct BuildResult {
     evidence: Evidence,
-    cache: Option<CacheUpload>,
     receipt: EvidenceReceipt,
     /// Uninterpreted evidence returned by the registry.
     facts: EvidenceList,
     /// Calculated locally from `facts`; it is never supplied by the registry.
     trust: trust::TrustScore,
-}
-
-#[derive(Serialize)]
-struct CacheUpload {
-    store_url: String,
-    output_paths: Vec<String>,
 }
 
 #[tokio::main]
@@ -80,7 +66,6 @@ async fn main() -> Result<()> {
             server,
             quiet,
             substitute,
-            binary_cache,
             claims,
             json,
         } => {
@@ -96,23 +81,6 @@ async fn main() -> Result<()> {
                 enabled_claims,
             )
             .await?;
-            let cache = if let Some(store_url) = binary_cache {
-                let output_paths = evidence
-                    .build_claim()
-                    .context("generated evidence has no build claim")?
-                    .build_statement
-                    .outputs
-                    .iter()
-                    .map(|output| output.output_store_path.clone())
-                    .collect::<Vec<_>>();
-                build::nix::copy_to_cache(&store_url, &output_paths, quiet).await?;
-                Some(CacheUpload {
-                    store_url,
-                    output_paths,
-                })
-            } else {
-                None
-            };
             let registry = client::RegistryClient::new(&server)?;
             let receipt = registry.submit(&evidence).await?;
             let derivation_path = evidence
@@ -125,7 +93,6 @@ async fn main() -> Result<()> {
 
             let result = BuildResult {
                 evidence,
-                cache,
                 receipt,
                 facts,
                 trust,
@@ -138,21 +105,6 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn parse_binary_cache_url(value: &str) -> Result<String, String> {
-    let url = reqwest::Url::parse(value).map_err(|error| error.to_string())?;
-    if url.scheme() != "s3" {
-        return Err("binary cache URL must use the s3 scheme".into());
-    }
-    if url.host_str().is_none_or(str::is_empty) {
-        return Err("binary cache URL must include a bucket name".into());
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err("binary cache URL must not contain credentials".into());
-    }
-
-    Ok(value.to_owned())
 }
 
 #[cfg(test)]
@@ -197,47 +149,6 @@ mod tests {
         .unwrap();
         let Command::Build { substitute, .. } = cli.command;
         assert!(substitute);
-    }
-
-    #[test]
-    fn build_accepts_s3_binary_cache() {
-        let cli = Cli::try_parse_from([
-            "reproductive-nix-cache",
-            "build",
-            "nixpkgs#hello",
-            "--builder-id",
-            "builder-a",
-            "--server",
-            "127.0.0.1:3000",
-            "--binary-cache",
-            "s3://nix-cache?scheme=http&endpoint=127.0.0.1:9000",
-        ])
-        .unwrap();
-        let Command::Build { binary_cache, .. } = cli.command;
-
-        assert_eq!(
-            binary_cache.as_deref(),
-            Some("s3://nix-cache?scheme=http&endpoint=127.0.0.1:9000")
-        );
-    }
-
-    #[test]
-    fn build_rejects_non_s3_binary_cache() {
-        let error = Cli::try_parse_from([
-            "reproductive-nix-cache",
-            "build",
-            "nixpkgs#hello",
-            "--builder-id",
-            "builder-a",
-            "--server",
-            "127.0.0.1:3000",
-            "--binary-cache",
-            "http://127.0.0.1:9000/nix-cache",
-        ])
-        .err()
-        .expect("non-S3 cache URL should be rejected");
-
-        assert!(error.to_string().contains("must use the s3 scheme"));
     }
 
     #[test]
