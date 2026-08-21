@@ -1,22 +1,35 @@
 # reproductive-nix-cache
 
 Evidence が複数の builder で一致した成果物だけを配信する、Nix Binary Cache
-ゲートウェイです。NAR の保存とアップロードは Attic などの upstream cache が担当し、
-このサーバーは `.narinfo` と NAR を合意判定後にプロキシします。
+ゲートウェイです。NAR の保存とアップロードは Attic などの builder が指定した
+cache が担当し、このサーバーは `.narinfo` と NAR を合意判定後にプロキシします。
 
 ## サーバー
 
-upstream cache は事前に `attic push` など、その cache 固有の方法で投入してください。
-
 ```console
 cargo run -p server -- \
-  --upstream-cache https://attic.example.com/builds \
   --cache-min-builders 2
 ```
 
-`--upstream-cache` は `NIX_CACHE_UPSTREAM_URL` でも指定できます。初版では認証なしの
-HTTP(S) cache を1つだけ使用できます。upstream 自体は外部公開せず、ゲートウェイから
-だけ到達可能にする構成を推奨します。
+各 builder は事前に `attic push` など、その cache 固有の方法で成果物を投入し、
+Evidence の reveal と同時に `--cache-location` で HTTP(S) cache のベース URI を通知します。
+合意した出力を報告した builder の URI だけが取得候補になり、`.narinfo` が合意結果と
+一致しない場合や取得できない場合は次の URIを試します。
+
+```console
+$ reproductive-nix-cache build nixpkgs#hello \
+    --builder-id builder-a \
+    --server 127.0.0.1:51337 \
+    --cache-location https://attic-a.example.com/builds
+$ reproductive-nix-cache build nixpkgs#hello \
+    --builder-id builder-b \
+    --server 127.0.0.1:51337 \
+    --cache-location https://attic-b.example.com/builds
+```
+
+`--cache-location` は複数回指定できます。URI は `http` または `https` に限られ、
+credentials、query、fragmentを含められません。redirectには追従せず、`.narinfo`
+内のNAR URLは通知されたcacheと同一originの場合だけ使用します。
 
 ## Nix Binary Cache として使う
 
@@ -31,8 +44,9 @@ HTTP(S) cache を1つだけ使用できます。upstream 自体は外部公開�
 }
 ```
 
-公開鍵には upstream cache が `.narinfo` の署名に使う鍵を設定します。ゲートウェイが
-書き換えるのは署名対象外の `URL` だけなので、upstream の署名をそのまま検証できます。
+公開鍵には各cacheが `.narinfo` の署名に使う鍵を設定します。複数cacheが異なる鍵を
+使う場合は、そのすべてを追加してください。ゲートウェイが書き換えるのは署名対象外の
+`URL` だけなので、cacheの署名をそのまま検証できます。
 
 ## Commit-reveal
 
@@ -46,9 +60,11 @@ Run independent builders concurrently so they join the same round:
 
 ```console
 $ reproductive-nix-cache build nixpkgs#hello \
-    --builder-id builder-a --server 127.0.0.1:51337
+    --builder-id builder-a --server 127.0.0.1:51337 \
+    --cache-location https://attic-a.example.com/builds
 $ reproductive-nix-cache build nixpkgs#hello \
-    --builder-id builder-b --server 127.0.0.1:51337
+    --builder-id builder-b --server 127.0.0.1:51337 \
+    --cache-location https://attic-b.example.com/builds
 ```
 
 The server closes the commit phase after two distinct builders or 60 seconds,

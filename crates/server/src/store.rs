@@ -1,6 +1,9 @@
-use crate::entity::{
-    build_claim, build_output as build_output_entity, claim, commitment,
-    evidence as evidence_entity, log_claim, round,
+use crate::{
+    cache_location as cache_location_validation,
+    entity::{
+        build_claim, build_output as build_output_entity, cache_location, claim, commitment,
+        evidence as evidence_entity, log_claim, round,
+    },
 };
 use anyhow::{Context, Result, bail};
 use chrono::{Duration, Utc};
@@ -73,6 +76,26 @@ pub struct OutputFingerprint {
     pub nar_hash: String,
     pub nar_size: u64,
     pub references: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheSource {
+    pub id: i64,
+    pub uri: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovedOutput {
+    pub round_id: i64,
+    pub store_path: String,
+    pub fingerprint: OutputFingerprint,
+    pub sources: Vec<CacheSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct OutputVariant {
+    store_path: String,
+    fingerprint: OutputFingerprint,
 }
 
 impl OutputFingerprint {
@@ -172,6 +195,7 @@ impl EvidenceStore {
         for entity in [
             schema.create_table_from_entity(round::Entity),
             schema.create_table_from_entity(evidence_entity::Entity),
+            schema.create_table_from_entity(cache_location::Entity),
             schema.create_table_from_entity(commitment::Entity),
             schema.create_table_from_entity(claim::Entity),
             schema.create_table_from_entity(build_claim::Entity),
@@ -222,6 +246,19 @@ impl EvidenceStore {
             .execute(backend.build(&output_store_path_index))
             .await
             .context("failed to create build output lookup index")?;
+
+        let mut cache_location_index = Index::create();
+        cache_location_index
+            .name("cache_locations_evidence_position_uidx")
+            .table(cache_location::Entity)
+            .col(cache_location::Column::EvidenceId)
+            .col(cache_location::Column::Position)
+            .unique()
+            .if_not_exists();
+        self.database
+            .execute(backend.build(&cache_location_index))
+            .await
+            .context("failed to create cache location index")?;
 
         self.database
             .execute_unprepared(
@@ -434,6 +471,12 @@ impl EvidenceStore {
             .evidence
             .validate()
             .map_err(ProtocolError::BadRequest)?;
+        let cache_locations = reveal
+            .cache_locations
+            .iter()
+            .map(cache_location_validation::normalize)
+            .collect::<Result<Vec<_>>>()
+            .map_err(|error| ProtocolError::BadRequest(error.to_string()))?;
         let derivation_path = reveal
             .evidence
             .build_claim()
@@ -519,6 +562,20 @@ impl EvidenceStore {
         let evidence_id = insert_evidence(&transaction, &reveal.evidence, now)
             .await
             .map_err(ProtocolError::internal)?;
+        for (position, uri) in cache_locations.into_iter().enumerate() {
+            let position = i64::try_from(position)
+                .context("too many cache locations")
+                .map_err(ProtocolError::internal)?;
+            cache_location::Entity::insert(cache_location::ActiveModel {
+                id: NotSet,
+                evidence_id: Set(evidence_id),
+                position: Set(position),
+                uri: Set(uri.to_string()),
+            })
+            .exec(&transaction)
+            .await
+            .map_err(ProtocolError::internal)?;
+        }
         let mut update: commitment::ActiveModel = committed.into();
         update.nonce = Set(Some(reveal.nonce.clone()));
         update.evidence_id = Set(Some(evidence_id));
@@ -746,17 +803,77 @@ impl EvidenceStore {
         }))
     }
 
-    pub async fn output_consensus(
+    pub async fn approved_output(
         &self,
-        store_path: &str,
+        store_hash: &str,
         minimum_builders: usize,
         config: RoundConfig,
-    ) -> Result<Option<OutputFingerprint>> {
+    ) -> Result<Option<ApprovedOutput>> {
+        self.approved_output_for_round(store_hash, None, minimum_builders, config)
+            .await
+    }
+
+    pub async fn approved_output_in_round(
+        &self,
+        store_hash: &str,
+        round_id: i64,
+        minimum_builders: usize,
+        config: RoundConfig,
+    ) -> Result<Option<ApprovedOutput>> {
+        self.approved_output_for_round(store_hash, Some(round_id), minimum_builders, config)
+            .await
+    }
+
+    async fn approved_output_for_round(
+        &self,
+        store_hash: &str,
+        round_id: Option<i64>,
+        minimum_builders: usize,
+        config: RoundConfig,
+    ) -> Result<Option<ApprovedOutput>> {
         let output_rows = build_output_entity::Entity::find()
-            .filter(build_output_entity::Column::OutputStorePath.eq(store_path))
+            .filter(
+                build_output_entity::Column::OutputStorePath
+                    .like(format!("/nix/store/{store_hash}-%")),
+            )
             .all(&self.database)
             .await
-            .context("failed to query build output evidence")?;
+            .context("failed to query build output evidence by store hash")?;
+        let Some((approved_round_id, variant, evidence_ids)) = self
+            .select_output_consensus(output_rows, round_id, minimum_builders, config)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let locations = cache_location::Entity::find()
+            .filter(cache_location::Column::EvidenceId.is_in(evidence_ids))
+            .order_by_asc(cache_location::Column::EvidenceId)
+            .order_by_asc(cache_location::Column::Position)
+            .all(&self.database)
+            .await
+            .context("failed to query approved cache locations")?;
+
+        Ok(Some(ApprovedOutput {
+            round_id: approved_round_id,
+            store_path: variant.store_path,
+            fingerprint: variant.fingerprint,
+            sources: locations
+                .into_iter()
+                .map(|location| CacheSource {
+                    id: location.id,
+                    uri: location.uri,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn select_output_consensus(
+        &self,
+        output_rows: Vec<build_output_entity::Model>,
+        requested_round_id: Option<i64>,
+        minimum_builders: usize,
+        config: RoundConfig,
+    ) -> Result<Option<(i64, OutputVariant, Vec<i64>)>> {
         let mut facts = Vec::new();
         let mut round_ids = BTreeSet::new();
         for output in output_rows {
@@ -777,11 +894,19 @@ impl EvidenceStore {
                 continue;
             };
             round_ids.insert(commitment.round_id);
-            facts.push((output, evidence.builder_id, commitment.round_id));
+            facts.push((
+                output,
+                evidence.id,
+                evidence.builder_id,
+                commitment.round_id,
+            ));
         }
 
         let mut latest: Option<(chrono::DateTime<Utc>, i64)> = None;
         for round_id in round_ids {
+            if requested_round_id.is_some_and(|requested| requested != round_id) {
+                continue;
+            }
             let Some(model) = round::Entity::find_by_id(round_id)
                 .one(&self.database)
                 .await
@@ -822,18 +947,21 @@ impl EvidenceStore {
             return Ok(None);
         };
 
-        let mut variants: BTreeMap<OutputFingerprint, BTreeSet<String>> = BTreeMap::new();
-        for (output, builder_id, round_id) in facts {
+        let mut variants: BTreeMap<OutputVariant, BTreeMap<String, i64>> = BTreeMap::new();
+        for (output, evidence_id, builder_id, round_id) in facts {
             if round_id != latest_round_id {
                 continue;
             }
             variants
-                .entry(OutputFingerprint::from_model(&output)?)
+                .entry(OutputVariant {
+                    store_path: output.output_store_path.clone(),
+                    fingerprint: OutputFingerprint::from_model(&output)?,
+                })
                 .or_default()
-                .insert(builder_id);
+                .insert(builder_id, evidence_id);
         }
 
-        let Some(maximum) = variants.values().map(BTreeSet::len).max() else {
+        let Some(maximum) = variants.values().map(BTreeMap::len).max() else {
             return Ok(None);
         };
         let mut leaders = variants
@@ -846,7 +974,11 @@ impl EvidenceStore {
             return Ok(None);
         }
 
-        Ok(Some(fingerprint))
+        Ok(Some((
+            latest_round_id,
+            fingerprint,
+            builders.into_values().collect(),
+        )))
     }
 
     async fn find_by_id(&self, id: i64) -> Result<Option<StoredEvidence>> {
@@ -1166,6 +1298,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reveal_persists_normalized_cache_locations_separately() {
+        let store = EvidenceStore::in_memory().await.unwrap();
+        let config = RoundConfig {
+            minimum_builders: 1,
+            ..RoundConfig::default()
+        };
+        let evidence = evidence("sha256-output");
+        let nonce = shared::generate_nonce().unwrap();
+        let commitment = CommitmentRequest {
+            builder_id: evidence.builder_id.clone(),
+            derivation_path: "/nix/store/hello.drv".into(),
+            digest: shared::evidence_commitment(&evidence, &nonce).unwrap(),
+        };
+        let receipt = store.commit(&commitment, config).await.unwrap();
+        let revealed = store
+            .reveal(
+                &EvidenceReveal {
+                    round_id: receipt.round.id,
+                    nonce,
+                    evidence,
+                    cache_locations: vec![shared::CacheLocation {
+                        uri: "https://cache.example.com/builds".into(),
+                    }],
+                },
+                config,
+            )
+            .await
+            .unwrap();
+
+        let locations = cache_location::Entity::find()
+            .filter(cache_location::Column::EvidenceId.eq(revealed.evidence.id))
+            .all(&store.database)
+            .await
+            .unwrap();
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0].uri, "https://cache.example.com/builds/");
+    }
+
+    #[tokio::test]
+    async fn reveal_rejects_unsafe_cache_locations() {
+        let store = EvidenceStore::in_memory().await.unwrap();
+        let config = RoundConfig {
+            minimum_builders: 1,
+            ..RoundConfig::default()
+        };
+        let evidence = evidence("sha256-output");
+        let nonce = shared::generate_nonce().unwrap();
+        let receipt = store
+            .commit(
+                &CommitmentRequest {
+                    builder_id: evidence.builder_id.clone(),
+                    derivation_path: "/nix/store/hello.drv".into(),
+                    digest: shared::evidence_commitment(&evidence, &nonce).unwrap(),
+                },
+                config,
+            )
+            .await
+            .unwrap();
+        let error = store
+            .reveal(
+                &EvidenceReveal {
+                    round_id: receipt.round.id,
+                    nonce,
+                    evidence,
+                    cache_locations: vec![shared::CacheLocation {
+                        uri: "https://user:secret@cache.example.com/".into(),
+                    }],
+                },
+                config,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ProtocolError::BadRequest(_)));
+    }
+
+    #[tokio::test]
     async fn separate_rounds_never_combine_into_cache_consensus() {
         let store = EvidenceStore::in_memory().await.unwrap();
         let config = RoundConfig {
@@ -1188,6 +1397,7 @@ mod tests {
                         round_id: receipt.round.id,
                         nonce,
                         evidence,
+                        cache_locations: Vec::new(),
                     },
                     config,
                 )
@@ -1195,9 +1405,14 @@ mod tests {
                 .unwrap();
         }
 
+        let output_rows = build_output_entity::Entity::find()
+            .filter(build_output_entity::Column::OutputStorePath.eq("/nix/store/hello-bin"))
+            .all(&store.database)
+            .await
+            .unwrap();
         assert!(
             store
-                .output_consensus("/nix/store/hello-bin", 2, config)
+                .select_output_consensus(output_rows, None, 2, config)
                 .await
                 .unwrap()
                 .is_none()
@@ -1234,6 +1449,7 @@ mod tests {
                     round_id: status.id,
                     nonce,
                     evidence,
+                    cache_locations: Vec::new(),
                 },
                 config,
             )
