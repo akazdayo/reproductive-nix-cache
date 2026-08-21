@@ -115,6 +115,7 @@ async fn main() -> Result<()> {
                     round_id,
                     nonce,
                     evidence: evidence.clone(),
+                    cache_locations: Vec::new(),
                 })
                 .await?;
             loop {

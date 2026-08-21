@@ -1,5 +1,6 @@
 mod api;
 mod binary_cache;
+mod cache_location;
 mod cli;
 mod config;
 mod entity;

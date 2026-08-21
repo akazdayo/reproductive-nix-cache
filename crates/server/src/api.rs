@@ -524,6 +524,7 @@ mod tests {
                             round_id,
                             nonce: nonce.into(),
                             evidence: evidence.clone(),
+                            cache_locations: Vec::new(),
                         })
                         .unwrap(),
                     ))
@@ -556,6 +557,7 @@ mod tests {
                         round_id,
                         nonce,
                         evidence,
+                        cache_locations: Vec::new(),
                     },
                     round_config,
                 )

@@ -101,11 +101,53 @@ pub mod evidence {
     pub enum Relation {
         #[sea_orm(has_many = "super::claim::Entity")]
         Claim,
+        #[sea_orm(has_many = "super::cache_location::Entity")]
+        CacheLocation,
     }
 
     impl Related<super::claim::Entity> for Entity {
         fn to() -> RelationDef {
             Relation::Claim.def()
+        }
+    }
+
+    impl Related<super::cache_location::Entity> for Entity {
+        fn to() -> RelationDef {
+            Relation::CacheLocation.def()
+        }
+    }
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod cache_location {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "cache_locations")]
+    pub struct Model {
+        #[sea_orm(primary_key)]
+        pub id: i64,
+        pub evidence_id: i64,
+        pub position: i64,
+        pub uri: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {
+        #[sea_orm(
+            belongs_to = "super::evidence::Entity",
+            from = "Column::EvidenceId",
+            to = "super::evidence::Column::Id",
+            on_update = "Cascade",
+            on_delete = "Cascade"
+        )]
+        Evidence,
+    }
+
+    impl Related<super::evidence::Entity> for Entity {
+        fn to() -> RelationDef {
+            Relation::Evidence.def()
         }
     }
 

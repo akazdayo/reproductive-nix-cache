@@ -26,6 +26,16 @@ pub struct EvidenceReveal {
     pub round_id: i64,
     pub nonce: String,
     pub evidence: Evidence,
+    #[serde(default)]
+    pub cache_locations: Vec<CacheLocation>,
+}
+
+/// An HTTP(S) Nix binary cache where the revealing builder made its outputs
+/// available. This is operational metadata and is not part of the evidence
+/// commitment or consensus vote.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheLocation {
+    pub uri: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
