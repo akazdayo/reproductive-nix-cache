@@ -1,19 +1,19 @@
 [package]
-name = "cli"
+name = "builder-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[[bin]]
-name = "reproductive-nix-cache"
-path = "src/main.rs"
-
 [dependencies]
-builder-core = { path = "../builder-core" }
 shared = { path = "../shared" }
 anyhow.workspace = true
-clap.workspace = true
+base64.workspace = true
 chrono.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+axum = "0.8.9"

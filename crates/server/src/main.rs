@@ -4,6 +4,7 @@ mod cache_location;
 mod cli;
 mod config;
 mod entity;
+mod round_manager;
 mod store;
 use anyhow::bail;
 use chrono::Duration;
@@ -33,9 +34,25 @@ async fn main() -> anyhow::Result<()> {
         reveal_window: Duration::seconds(cli.reveal_window_seconds),
     };
     let cache = binary_cache::BinaryCache::new(cli.cache_min_builders)?;
-    let state = api::AppState::new(store)
+    let mut state = api::AppState::new(store)
         .with_round_config(round_config)
         .with_binary_cache(cache);
+    if !cli.builder_nodes.is_empty() {
+        if cli.builder_nodes.len() < cli.commit_min_builders {
+            bail!(
+                "configured builder nodes must be at least --commit-min-builders ({})",
+                cli.commit_min_builders
+            );
+        }
+        let manager_token = cli
+            .manager_token
+            .ok_or_else(|| anyhow::anyhow!("NIX_CACHE_MANAGER_TOKEN is required"))?;
+        let builder_token = cli
+            .builder_token
+            .ok_or_else(|| anyhow::anyhow!("NIX_CACHE_BUILDER_TOKEN is required"))?;
+        let manager = round_manager::RoundManager::new(cli.builder_nodes, builder_token)?;
+        state = state.with_round_manager(manager, manager_token);
+    }
     let app = api::router(state);
     let listener = TcpListener::bind(listen).await?;
     eprintln!(

@@ -13,6 +13,30 @@ impl Package {
     pub fn reference(&self) -> String {
         format!("{}#{}", self.repository, self.name)
     }
+
+    pub fn parse_reference(reference: &str) -> Result<Self, String> {
+        let (repository, name) = reference.split_once('#').ok_or_else(|| {
+            "package reference must have the form <flake>#<attribute>, for example nixpkgs#hello"
+                .to_owned()
+        })?;
+        if repository.is_empty()
+            || name.is_empty()
+            || name.contains('#')
+            || repository.chars().any(char::is_whitespace)
+            || name.chars().any(char::is_whitespace)
+        {
+            return Err(
+                "package reference must have the form <flake>#<attribute>, for example nixpkgs#hello"
+                    .into(),
+            );
+        }
+        validate_text("package.repository", repository, 2048)?;
+        validate_text("package.name", name, 1024)?;
+        Ok(Self {
+            repository: repository.into(),
+            name: name.into(),
+        })
+    }
 }
 
 /// Immutable information about the flake used when evaluating a package.

@@ -1,5 +1,7 @@
 [workspace]
 members = [
+    "crates/builder-core",
+    "crates/builder-node",
     "crates/cli",
     "crates/server",
     "crates/shared",

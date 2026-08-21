@@ -1,18 +1,13 @@
-mod build;
-mod claims;
-mod client;
 mod output;
 mod trust;
-mod utils;
 
-use anyhow::{Context, Result};
-use claims::ClaimKind;
+use anyhow::Result;
+use builder_core::{BuilderConfig, Host, execute_build};
 use clap::{Parser, Subcommand};
-use client::Host;
 use serde::Serialize;
 use shared::{
-    CacheLocation, CommitmentReceipt, CommitmentRequest, Evidence, EvidenceList, EvidenceReceipt,
-    EvidenceReveal, RoundPhase, RoundStatus, evidence_commitment, generate_nonce,
+    BuildCommand, ClaimKind, CommitmentReceipt, Evidence, EvidenceList, EvidenceReceipt,
+    RoundStatus,
 };
 
 #[derive(Parser)]
@@ -78,69 +73,28 @@ async fn main() -> Result<()> {
             claims,
             json,
         } => {
-            let package = utils::parse_nix_repository(&package_ref).with_context(|| {
-                "package reference must have the form <flake>#<attribute>, for example nixpkgs#hello"
-            })?;
-            let enabled_claims = ClaimKind::with_required_build(claims);
-            let evidence = build::evidence::generate_evidence(
-                package,
-                builder_id,
-                quiet,
-                substitute,
-                enabled_claims,
+            let execution = execute_build(
+                &BuildCommand {
+                    package_ref,
+                    substitute,
+                    claims,
+                },
+                &BuilderConfig {
+                    builder_id,
+                    server,
+                    cache_locations,
+                    quiet,
+                },
             )
             .await?;
-            let registry = client::RegistryClient::new(&server)?;
-            let derivation_path = evidence
-                .build_claim()
-                .context("generated evidence has no build claim")?
-                .derivation_path
-                .clone();
-            let nonce = generate_nonce().map_err(anyhow::Error::msg)?;
-            let digest = evidence_commitment(&evidence, &nonce).map_err(anyhow::Error::msg)?;
-            let commitment = registry
-                .commit(&CommitmentRequest {
-                    builder_id: evidence.builder_id.clone(),
-                    derivation_path,
-                    digest,
-                })
-                .await?;
-            let round_id = commitment.round.id;
-            let mut round = commitment.round.clone();
-            while round.phase == RoundPhase::Committing {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                round = registry.round_status(round_id).await?;
-            }
-            if round.phase != RoundPhase::Revealing {
-                anyhow::bail!("commit-reveal round closed before this evidence was revealed");
-            }
-            let receipt = registry
-                .reveal(&EvidenceReveal {
-                    round_id,
-                    nonce,
-                    evidence: evidence.clone(),
-                    cache_locations: cache_locations
-                        .into_iter()
-                        .map(|uri| CacheLocation { uri })
-                        .collect(),
-                })
-                .await?;
-            loop {
-                round = registry.round_status(round_id).await?;
-                if round.phase.is_closed() {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
-            let facts = registry.round_facts(round_id).await?;
-            let trust = trust::calculate_trust(&facts);
+            let trust = trust::calculate_trust(&execution.facts);
 
             let result = BuildResult {
-                evidence,
-                commitment,
-                receipt,
-                round,
-                facts,
+                evidence: execution.evidence,
+                commitment: execution.commitment,
+                receipt: execution.receipt,
+                round: execution.round,
+                facts: execution.facts,
                 trust,
             };
             if json {
@@ -175,8 +129,8 @@ mod tests {
         assert!(claims.is_empty());
         assert!(!substitute);
         assert_eq!(
-            crate::claims::ClaimKind::with_required_build(claims),
-            vec![crate::claims::ClaimKind::Build]
+            ClaimKind::with_required_build(claims),
+            vec![ClaimKind::Build]
         );
     }
 
@@ -257,13 +211,10 @@ mod tests {
         ])
         .unwrap();
         let Command::Build { claims, .. } = cli.command;
-        assert_eq!(claims, vec![crate::claims::ClaimKind::Log]);
+        assert_eq!(claims, vec![ClaimKind::Log]);
         assert_eq!(
-            crate::claims::ClaimKind::with_required_build(claims),
-            vec![
-                crate::claims::ClaimKind::Build,
-                crate::claims::ClaimKind::Log
-            ]
+            ClaimKind::with_required_build(claims),
+            vec![ClaimKind::Build, ClaimKind::Log]
         );
     }
 }

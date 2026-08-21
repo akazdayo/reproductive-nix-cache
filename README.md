@@ -31,6 +31,45 @@ $ reproductive-nix-cache build nixpkgs#hello \
 credentials、query、fragmentを含められません。redirectには追従せず、`.narinfo`
 内のNAR URLは通知されたcacheと同一originの場合だけ使用します。
 
+## Builder Node と Round Manager
+
+Builder Node はHTTPで受け取った命令を使って常駐ビルドし、CLIと同じ処理で
+Evidenceをcommit/revealします。Builder固有のID、registry、cache locationは
+Node側に固定され、ビルド命令から上書きできません。
+
+```console
+$ NIX_CACHE_BUILDER_TOKEN=builder-secret \
+  cargo run -p builder-node -- \
+    --listen 0.0.0.0:51338 \
+    --builder-id builder-a \
+    --server 127.0.0.1:51337 \
+    --cache-location https://attic-a.example.com/builds
+```
+
+既存serverをRound Managerとして使う場合は、Builder Nodeのoriginを複数指定します。
+設定したNode数は `--commit-min-builders` 以上である必要があります。
+
+```console
+$ NIX_CACHE_MANAGER_TOKEN=manager-secret \
+  NIX_CACHE_BUILDER_TOKEN=builder-secret \
+  cargo run -p server -- \
+    --builder-node http://builder-a.internal:51338 \
+    --builder-node http://builder-b.internal:51338
+```
+
+```console
+$ curl -X POST http://127.0.0.1:51337/v1/builds \
+    -H 'Authorization: Bearer manager-secret' \
+    -H 'Content-Type: application/json' \
+    -d '{"package_ref":"nixpkgs#hello","substitute":false,"claims":[]}'
+```
+
+Round Managerは同じJSONを全Nodeへ並列送信し、全Nodeの処理完了後に結果を集約して
+返します。初期版は同期実行で、各Nodeは同時に1ビルドだけ受け付けます。
+各NodeはEvidence完成後にcommitするため、Node間のビルド完了時刻の差が
+`--commit-window-seconds` を超えないよう、実際のビルド時間に合わせてwindowを
+設定してください。
+
 ## Nix Binary Cache として使う
 
 ```nix
