@@ -23,7 +23,7 @@ async fn main() -> anyhow::Result<()> {
     if cli.commit_window_seconds <= 0 || cli.reveal_window_seconds <= 0 {
         bail!("commit and reveal windows must be at least 1 second");
     }
-    if cli.binary_cache.is_some() && cli.commit_min_builders < cli.cache_min_builders {
+    if cli.upstream_cache.is_some() && cli.commit_min_builders < cli.cache_min_builders {
         bail!("--commit-min-builders must be at least --cache-min-builders");
     }
     let round_config = store::RoundConfig {
@@ -32,16 +32,17 @@ async fn main() -> anyhow::Result<()> {
         reveal_window: Duration::seconds(cli.reveal_window_seconds),
     };
     let mut state = api::AppState::new(store).with_round_config(round_config);
-    if let Some(store_url) = &cli.binary_cache {
-        let cache = binary_cache::BinaryCache::from_s3_url(store_url, cli.cache_min_builders)?;
+    if let Some(upstream_url) = &cli.upstream_cache {
+        let cache =
+            binary_cache::BinaryCache::from_upstream_url(upstream_url, cli.cache_min_builders)?;
         state = state.with_binary_cache(cache);
     }
     let app = api::router(state);
     let listener = TcpListener::bind(listen).await?;
     eprintln!(
-        "reproductive-nix-cache server listening on {listen}; database: {}; binary cache: {}",
+        "reproductive-nix-cache server listening on {listen}; database: {}; upstream cache: {}",
         database.display(),
-        cli.binary_cache.as_deref().unwrap_or("disabled")
+        cli.upstream_cache.as_deref().unwrap_or("disabled")
     );
     axum::serve(listener, app).await?;
 

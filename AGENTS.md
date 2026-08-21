@@ -5,14 +5,14 @@
 This Rust 2024 workspace contains three crates:
 
 - `crates/cli`: the `reproductive-nix-cache` command. Build orchestration lives under `src/build/`; registry access, claims, trust calculation, and output formatting are separate modules.
-- `crates/server`: the Axum registry and binary-cache server. API routes, SQLite persistence, configuration, and S3-compatible object storage are split by module.
+- `crates/server`: the Axum registry and binary-cache gateway. API routes, SQLite persistence, configuration, and HTTP upstream access are split by module.
 - `crates/shared`: evidence types shared by both binaries.
 
 Tests are colocated with implementation code in `#[cfg(test)]` modules. Root files include the workspace manifests, Nix flake, licenses, and a short usage-oriented `README.md`.
 
 ## Build, Test, and Development Commands
 
-Enter the reproducible shell with `direnv allow` or `nix develop`. The shell supplies stable Rust, Nix tooling, RustFS, and formatting hooks.
+Enter the reproducible shell with `direnv allow` or `nix develop`. The shell supplies stable Rust, Nix tooling, and formatting hooks.
 
 - `cargo build --workspace`: compile every crate.
 - `cargo test --workspace`: run unit and async integration-style tests.
@@ -37,4 +37,4 @@ History follows Conventional Commit-style prefixes, chiefly `feat:`, `fix:`, and
 
 ## Security & Local Configuration
 
-Values in `flake.nix` configure loopback-only RustFS development credentials. Never reuse them in production or commit real secrets, access keys, databases, or generated `.rustfs/` data.
+Do not commit real secrets, access tokens, databases, or generated cache data. Keep an upstream binary cache network-private when it should only be reachable through the consensus gateway.

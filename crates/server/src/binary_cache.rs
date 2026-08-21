@@ -1,73 +1,50 @@
 use crate::store::{EvidenceStore, OutputFingerprint, RoundConfig};
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use object_store::{
-    GetResult, ObjectMeta, ObjectStore, ObjectStoreExt, aws::AmazonS3Builder,
-    path::Path as ObjectPath,
-};
-use std::sync::Arc;
-use url::Url;
+use reqwest::{Client, Response, StatusCode, Url, redirect::Policy};
+use std::time::Duration;
 
 pub const CACHE_INFO: &str = "StoreDir: /nix/store\nWantMassQuery: 0\nPriority: 30\n";
+const MAX_NARINFO_SIZE: usize = 1024 * 1024;
 
 #[derive(Clone)]
 pub struct BinaryCache {
-    objects: Arc<dyn ObjectStore>,
+    upstream: Url,
+    client: Client,
     minimum_builders: usize,
 }
 
+pub struct ApprovedNarInfo {
+    pub bytes: Vec<u8>,
+    upstream_nar_url: Url,
+}
+
 impl BinaryCache {
-    pub fn from_s3_url(store_url: &str, minimum_builders: usize) -> Result<Self> {
-        let url = Url::parse(store_url).context("invalid binary cache URL")?;
-        if url.scheme() != "s3" {
-            bail!("binary cache URL must use the s3 scheme");
-        }
-        let bucket = url
-            .host_str()
-            .filter(|bucket| !bucket.is_empty())
-            .context("binary cache URL must include a bucket name")?;
-
-        let mut endpoint = None;
-        let mut endpoint_scheme = "https".to_owned();
-        let mut region = std::env::var("AWS_REGION")
-            .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
-            .unwrap_or_else(|_| "us-east-1".into());
-        for (key, value) in url.query_pairs() {
-            match key.as_ref() {
-                "endpoint" => endpoint = Some(value.into_owned()),
-                "scheme" => endpoint_scheme = value.into_owned(),
-                "region" => region = value.into_owned(),
-                _ => {}
-            }
-        }
-
-        let mut builder = AmazonS3Builder::from_env()
-            .with_bucket_name(bucket)
-            .with_region(region);
-        if let Some(endpoint) = endpoint {
-            if endpoint_scheme != "http" && endpoint_scheme != "https" {
-                bail!("binary cache endpoint scheme must be http or https");
-            }
-            builder = builder
-                .with_endpoint(format!("{endpoint_scheme}://{endpoint}"))
-                .with_allow_http(endpoint_scheme == "http");
-        }
-        let objects = builder
+    pub fn from_upstream_url(upstream: &str, minimum_builders: usize) -> Result<Self> {
+        let upstream = normalize_upstream_url(upstream)?;
+        let client = Client::builder()
+            .redirect(Policy::none())
+            .connect_timeout(Duration::from_secs(10))
             .build()
-            .context("failed to configure S3 binary cache")?;
-        Ok(Self::new(Arc::new(objects), minimum_builders))
-    }
-
-    fn new(objects: Arc<dyn ObjectStore>, minimum_builders: usize) -> Self {
-        Self {
-            objects,
+            .context("failed to configure HTTP binary cache client")?;
+        Ok(Self {
+            upstream,
+            client,
             minimum_builders,
-        }
+        })
     }
 
     #[cfg(test)]
-    pub fn for_tests(objects: Arc<dyn ObjectStore>, minimum_builders: usize) -> Self {
-        Self::new(objects, minimum_builders)
+    pub fn for_tests(upstream: Url, minimum_builders: usize) -> Self {
+        Self {
+            upstream,
+            client: Client::builder()
+                .redirect(Policy::none())
+                .connect_timeout(Duration::from_secs(10))
+                .build()
+                .unwrap(),
+            minimum_builders,
+        }
     }
 
     pub async fn approved_narinfo(
@@ -75,17 +52,13 @@ impl BinaryCache {
         evidence: &EvidenceStore,
         key: &str,
         round_config: RoundConfig,
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<Option<ApprovedNarInfo>> {
         let Some(store_hash) = key.strip_suffix(".narinfo").filter(|hash| valid_hash(hash)) else {
             return Ok(None);
         };
-        let Some(result) = self.get(key).await? else {
+        let Some(bytes) = self.get_narinfo(key).await? else {
             return Ok(None);
         };
-        let bytes = result
-            .bytes()
-            .await
-            .context("failed to read narinfo from object storage")?;
         let narinfo = NarInfo::parse(&bytes)?;
         if narinfo.store_hash() != Some(store_hash) {
             return Ok(None);
@@ -100,40 +73,124 @@ impl BinaryCache {
             return Ok(None);
         }
 
+        let upstream_nar_url = self.resolve_nar_url(&narinfo.url)?;
+        let bytes = rewrite_nar_url(&bytes, &format!("nar/{store_hash}"))?;
+        Ok(Some(ApprovedNarInfo {
+            bytes,
+            upstream_nar_url,
+        }))
+    }
+
+    pub async fn get_nar(
+        &self,
+        evidence: &EvidenceStore,
+        store_hash: &str,
+        round_config: RoundConfig,
+    ) -> Result<Option<Response>> {
+        let Some(approved) = self
+            .approved_by_hash(evidence, store_hash, round_config)
+            .await?
+        else {
+            return Ok(None);
+        };
+        self.send_nar(self.client.get(approved.upstream_nar_url))
+            .await
+    }
+
+    pub async fn head_nar(
+        &self,
+        evidence: &EvidenceStore,
+        store_hash: &str,
+        round_config: RoundConfig,
+    ) -> Result<Option<Response>> {
+        let Some(approved) = self
+            .approved_by_hash(evidence, store_hash, round_config)
+            .await?
+        else {
+            return Ok(None);
+        };
+        self.send_nar(self.client.head(approved.upstream_nar_url))
+            .await
+    }
+
+    async fn approved_by_hash(
+        &self,
+        evidence: &EvidenceStore,
+        store_hash: &str,
+        round_config: RoundConfig,
+    ) -> Result<Option<ApprovedNarInfo>> {
+        if !valid_hash(store_hash) {
+            return Ok(None);
+        }
+        self.approved_narinfo(evidence, &format!("{store_hash}.narinfo"), round_config)
+            .await
+    }
+
+    async fn get_narinfo(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        let url = self
+            .upstream
+            .join(key)
+            .context("failed to construct upstream narinfo URL")?;
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .context("failed to request narinfo from upstream cache")?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            bail!("upstream cache returned {} for narinfo", response.status());
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_NARINFO_SIZE as u64)
+        {
+            bail!("upstream narinfo exceeds {MAX_NARINFO_SIZE} bytes");
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .context("failed to read narinfo from upstream cache")?;
+        if bytes.len() > MAX_NARINFO_SIZE {
+            bail!("upstream narinfo exceeds {MAX_NARINFO_SIZE} bytes");
+        }
         Ok(Some(bytes.to_vec()))
     }
 
-    pub async fn get_nar(&self, key: &str) -> Result<Option<GetResult>> {
-        let Some(key) = nar_key(key) else {
+    async fn send_nar(&self, request: reqwest::RequestBuilder) -> Result<Option<Response>> {
+        let response = request
+            .send()
+            .await
+            .context("failed to request NAR from upstream cache")?;
+        if response.status() == StatusCode::NOT_FOUND {
             return Ok(None);
-        };
-        self.get(&key).await
+        }
+        if !response.status().is_success() {
+            bail!("upstream cache returned {} for NAR", response.status());
+        }
+        Ok(Some(response))
     }
 
-    pub async fn head_nar(&self, key: &str) -> Result<Option<ObjectMeta>> {
-        let Some(key) = nar_key(key) else {
-            return Ok(None);
-        };
-        let path = ObjectPath::parse(key).context("invalid NAR object key")?;
-        match self.objects.head(&path).await {
-            Ok(meta) => Ok(Some(meta)),
-            Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(error) => Err(error).context("failed to read NAR metadata from object storage"),
+    fn resolve_nar_url(&self, value: &str) -> Result<Url> {
+        let resolved = self
+            .upstream
+            .join(value)
+            .context("narinfo contains an invalid URL")?;
+        let same_origin = resolved.scheme() == self.upstream.scheme()
+            && resolved.host_str() == self.upstream.host_str()
+            && resolved.port_or_known_default() == self.upstream.port_or_known_default();
+        if !same_origin || !resolved.path().starts_with(self.upstream.path()) {
+            bail!("narinfo URL escapes the configured upstream cache");
         }
-    }
-
-    async fn get(&self, key: &str) -> Result<Option<GetResult>> {
-        let path = ObjectPath::parse(key).context("invalid binary cache object key")?;
-        match self.objects.get(&path).await {
-            Ok(result) => Ok(Some(result)),
-            Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(error) => Err(error).context("failed to read from binary cache object storage"),
-        }
+        Ok(resolved)
     }
 }
 
 struct NarInfo {
     store_path: String,
+    url: String,
     nar_hash: String,
     nar_size: u64,
     references: Vec<String>,
@@ -142,17 +199,24 @@ struct NarInfo {
 impl NarInfo {
     fn parse(bytes: &[u8]) -> Result<Self> {
         let contents = std::str::from_utf8(bytes).context("narinfo is not UTF-8")?;
+        if !contents.ends_with('\n') {
+            bail!("narinfo does not end with a newline");
+        }
         let required = |name: &str| {
-            contents
+            let prefix = format!("{name}: ");
+            let mut values = contents
                 .lines()
-                .find_map(|line| {
-                    line.strip_prefix(name)
-                        .and_then(|line| line.strip_prefix(": "))
-                })
-                .map(str::to_owned)
-                .with_context(|| format!("narinfo is missing {name}"))
+                .filter_map(|line| line.strip_prefix(&prefix));
+            let value = values
+                .next()
+                .with_context(|| format!("narinfo is missing {name}"))?;
+            if values.next().is_some() {
+                bail!("narinfo contains duplicate {name}");
+            }
+            Ok(value.to_owned())
         };
         let store_path = required("StorePath")?;
+        let url = required("URL")?;
         let nar_hash = required("NarHash")?;
         let nar_size = required("NarSize")?
             .parse()
@@ -170,6 +234,7 @@ impl NarInfo {
 
         Ok(Self {
             store_path,
+            url,
             nar_hash,
             nar_size,
             references,
@@ -191,6 +256,53 @@ impl NarInfo {
             && self.nar_size == fingerprint.nar_size
             && references == fingerprint.references
     }
+}
+
+fn normalize_upstream_url(value: &str) -> Result<Url> {
+    let mut url = Url::parse(value).context("invalid upstream cache URL")?;
+    if url.scheme() != "http" && url.scheme() != "https" {
+        bail!("upstream cache URL must use the http or https scheme");
+    }
+    if url.host_str().is_none() {
+        bail!("upstream cache URL must include a host");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("upstream cache URL must not contain credentials");
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        bail!("upstream cache URL must not contain a query or fragment");
+    }
+    if !url.path().ends_with('/') {
+        let path = format!("{}/", url.path());
+        url.set_path(&path);
+    }
+    Ok(url)
+}
+
+fn rewrite_nar_url(bytes: &[u8], gateway_url: &str) -> Result<Vec<u8>> {
+    let contents = std::str::from_utf8(bytes).context("narinfo is not UTF-8")?;
+    let mut rewritten = String::with_capacity(contents.len());
+    let mut found = false;
+    for line in contents.split_inclusive('\n') {
+        if line
+            .strip_suffix('\n')
+            .is_some_and(|line| line.starts_with("URL: "))
+        {
+            if found {
+                bail!("narinfo contains duplicate URL");
+            }
+            found = true;
+            rewritten.push_str("URL: ");
+            rewritten.push_str(gateway_url);
+            rewritten.push('\n');
+        } else {
+            rewritten.push_str(line);
+        }
+    }
+    if !found {
+        bail!("narinfo is missing URL");
+    }
+    Ok(rewritten.into_bytes())
 }
 
 fn hashes_equal(left: &str, right: &str) -> bool {
@@ -215,26 +327,20 @@ fn valid_hash(hash: &str) -> bool {
     hash.len() == 32 && hash.chars().all(|character| NIX_BASE32.contains(character))
 }
 
-fn nar_key(key: &str) -> Option<String> {
-    if key.is_empty() || key.contains("..") || key.starts_with('/') {
-        return None;
-    }
-    Some(format!("nar/{key}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn parses_and_matches_narinfo() {
-        let bytes = b"StorePath: /nix/store/00000000000000000000000000000000-hello\n\
+    const NARINFO: &[u8] = b"StorePath: /nix/store/00000000000000000000000000000000-hello\n\
 URL: nar/example.nar.xz\n\
 Compression: xz\n\
 NarHash: sha256:0f3gg73cybjfnzlav06r5ndr4711wv2gjkgk2s0lghp2h3cy6db7\n\
 NarSize: 1234\n\
 References: b-glibc a-libgcc\n";
-        let narinfo = NarInfo::parse(bytes).unwrap();
+
+    #[test]
+    fn parses_and_matches_narinfo() {
+        let narinfo = NarInfo::parse(NARINFO).unwrap();
         assert_eq!(
             narinfo.store_hash(),
             Some("00000000000000000000000000000000")
@@ -247,14 +353,36 @@ References: b-glibc a-libgcc\n";
     }
 
     #[test]
-    fn rejects_unsafe_nar_keys() {
-        assert_eq!(nar_key("example.nar.xz"), Some("nar/example.nar.xz".into()));
+    fn rewrites_only_the_nar_url() {
+        let rewritten = rewrite_nar_url(NARINFO, "nar/00000000000000000000000000000000").unwrap();
+        let rewritten = String::from_utf8(rewritten).unwrap();
+        assert!(rewritten.contains("URL: nar/00000000000000000000000000000000\n"));
+        assert!(rewritten.contains("NarSize: 1234\n"));
+    }
+
+    #[test]
+    fn validates_and_normalizes_upstream_urls() {
         assert_eq!(
-            nar_key("example.nar.zst"),
-            Some("nar/example.nar.zst".into())
+            normalize_upstream_url("https://cache.example.com/cache")
+                .unwrap()
+                .as_str(),
+            "https://cache.example.com/cache/"
         );
-        assert_eq!(nar_key("../example.nar.xz"), None);
-        assert_eq!(nar_key("/example.nar.xz"), None);
+        assert!(normalize_upstream_url("s3://cache").is_err());
+        assert!(normalize_upstream_url("https://user:secret@cache.example.com").is_err());
+    }
+
+    #[test]
+    fn rejects_nar_urls_outside_the_upstream_cache() {
+        let cache =
+            BinaryCache::for_tests(Url::parse("https://cache.example.com/private/").unwrap(), 1);
+        assert!(cache.resolve_nar_url("nar/example.nar.xz").is_ok());
+        assert!(cache.resolve_nar_url("/nar/example.nar.xz").is_err());
+        assert!(
+            cache
+                .resolve_nar_url("https://evil.example/nar/example.nar.xz")
+                .is_err()
+        );
     }
 
     #[test]
