@@ -78,6 +78,25 @@ pub struct OutputFingerprint {
     pub references: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheSource {
+    pub id: i64,
+    pub uri: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovedOutput {
+    pub store_path: String,
+    pub fingerprint: OutputFingerprint,
+    pub sources: Vec<CacheSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct OutputVariant {
+    store_path: String,
+    fingerprint: OutputFingerprint,
+}
+
 impl OutputFingerprint {
     fn from_model(output: &build_output_entity::Model) -> Result<Self> {
         let references: Vec<String> = serde_json::from_str(&output.references_json)
@@ -783,17 +802,53 @@ impl EvidenceStore {
         }))
     }
 
-    pub async fn output_consensus(
+    pub async fn approved_output(
         &self,
-        store_path: &str,
+        store_hash: &str,
         minimum_builders: usize,
         config: RoundConfig,
-    ) -> Result<Option<OutputFingerprint>> {
+    ) -> Result<Option<ApprovedOutput>> {
         let output_rows = build_output_entity::Entity::find()
-            .filter(build_output_entity::Column::OutputStorePath.eq(store_path))
+            .filter(
+                build_output_entity::Column::OutputStorePath
+                    .like(format!("/nix/store/{store_hash}-%")),
+            )
             .all(&self.database)
             .await
-            .context("failed to query build output evidence")?;
+            .context("failed to query build output evidence by store hash")?;
+        let Some((variant, evidence_ids)) = self
+            .select_output_consensus(output_rows, minimum_builders, config)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let locations = cache_location::Entity::find()
+            .filter(cache_location::Column::EvidenceId.is_in(evidence_ids))
+            .order_by_asc(cache_location::Column::EvidenceId)
+            .order_by_asc(cache_location::Column::Position)
+            .all(&self.database)
+            .await
+            .context("failed to query approved cache locations")?;
+
+        Ok(Some(ApprovedOutput {
+            store_path: variant.store_path,
+            fingerprint: variant.fingerprint,
+            sources: locations
+                .into_iter()
+                .map(|location| CacheSource {
+                    id: location.id,
+                    uri: location.uri,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn select_output_consensus(
+        &self,
+        output_rows: Vec<build_output_entity::Model>,
+        minimum_builders: usize,
+        config: RoundConfig,
+    ) -> Result<Option<(OutputVariant, Vec<i64>)>> {
         let mut facts = Vec::new();
         let mut round_ids = BTreeSet::new();
         for output in output_rows {
@@ -814,7 +869,12 @@ impl EvidenceStore {
                 continue;
             };
             round_ids.insert(commitment.round_id);
-            facts.push((output, evidence.builder_id, commitment.round_id));
+            facts.push((
+                output,
+                evidence.id,
+                evidence.builder_id,
+                commitment.round_id,
+            ));
         }
 
         let mut latest: Option<(chrono::DateTime<Utc>, i64)> = None;
@@ -859,18 +919,21 @@ impl EvidenceStore {
             return Ok(None);
         };
 
-        let mut variants: BTreeMap<OutputFingerprint, BTreeSet<String>> = BTreeMap::new();
-        for (output, builder_id, round_id) in facts {
+        let mut variants: BTreeMap<OutputVariant, BTreeMap<String, i64>> = BTreeMap::new();
+        for (output, evidence_id, builder_id, round_id) in facts {
             if round_id != latest_round_id {
                 continue;
             }
             variants
-                .entry(OutputFingerprint::from_model(&output)?)
+                .entry(OutputVariant {
+                    store_path: output.output_store_path.clone(),
+                    fingerprint: OutputFingerprint::from_model(&output)?,
+                })
                 .or_default()
-                .insert(builder_id);
+                .insert(builder_id, evidence_id);
         }
 
-        let Some(maximum) = variants.values().map(BTreeSet::len).max() else {
+        let Some(maximum) = variants.values().map(BTreeMap::len).max() else {
             return Ok(None);
         };
         let mut leaders = variants
@@ -883,7 +946,7 @@ impl EvidenceStore {
             return Ok(None);
         }
 
-        Ok(Some(fingerprint))
+        Ok(Some((fingerprint, builders.into_values().collect())))
     }
 
     async fn find_by_id(&self, id: i64) -> Result<Option<StoredEvidence>> {
@@ -1310,9 +1373,14 @@ mod tests {
                 .unwrap();
         }
 
+        let output_rows = build_output_entity::Entity::find()
+            .filter(build_output_entity::Column::OutputStorePath.eq("/nix/store/hello-bin"))
+            .all(&store.database)
+            .await
+            .unwrap();
         assert!(
             store
-                .output_consensus("/nix/store/hello-bin", 2, config)
+                .select_output_consensus(output_rows, 2, config)
                 .await
                 .unwrap()
                 .is_none()

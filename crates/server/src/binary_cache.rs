@@ -1,4 +1,4 @@
-use crate::store::{EvidenceStore, OutputFingerprint, RoundConfig};
+use crate::store::{ApprovedOutput, CacheSource, EvidenceStore, OutputFingerprint, RoundConfig};
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::{Client, Response, StatusCode, Url, redirect::Policy};
@@ -9,7 +9,6 @@ const MAX_NARINFO_SIZE: usize = 1024 * 1024;
 
 #[derive(Clone)]
 pub struct BinaryCache {
-    upstream: Url,
     client: Client,
     minimum_builders: usize,
 }
@@ -20,27 +19,26 @@ pub struct ApprovedNarInfo {
 }
 
 impl BinaryCache {
-    pub fn from_upstream_url(upstream: &str, minimum_builders: usize) -> Result<Self> {
-        let upstream = normalize_upstream_url(upstream)?;
+    pub fn new(minimum_builders: usize) -> Result<Self> {
         let client = Client::builder()
             .redirect(Policy::none())
             .connect_timeout(Duration::from_secs(10))
+            .read_timeout(Duration::from_secs(30))
             .build()
             .context("failed to configure HTTP binary cache client")?;
         Ok(Self {
-            upstream,
             client,
             minimum_builders,
         })
     }
 
     #[cfg(test)]
-    pub fn for_tests(upstream: Url, minimum_builders: usize) -> Self {
+    pub fn for_tests(minimum_builders: usize) -> Self {
         Self {
-            upstream,
             client: Client::builder()
                 .redirect(Policy::none())
                 .connect_timeout(Duration::from_secs(10))
+                .read_timeout(Duration::from_secs(30))
                 .build()
                 .unwrap(),
             minimum_builders,
@@ -56,39 +54,43 @@ impl BinaryCache {
         let Some(store_hash) = key.strip_suffix(".narinfo").filter(|hash| valid_hash(hash)) else {
             return Ok(None);
         };
-        let Some(bytes) = self.get_narinfo(key).await? else {
-            return Ok(None);
-        };
-        let narinfo = NarInfo::parse(&bytes)?;
-        if narinfo.store_hash() != Some(store_hash) {
-            return Ok(None);
-        }
-        let Some(consensus) = evidence
-            .output_consensus(&narinfo.store_path, self.minimum_builders, round_config)
+        let Some(approved) = evidence
+            .approved_output(store_hash, self.minimum_builders, round_config)
             .await?
         else {
             return Ok(None);
         };
-        if !narinfo.matches(&consensus) {
-            return Ok(None);
+        let mut last_error = None;
+        for source in &approved.sources {
+            match self
+                .approved_from_source(&approved, source, store_hash, key)
+                .await
+            {
+                Ok(Some(narinfo)) => return Ok(Some(narinfo)),
+                Ok(None) => {}
+                Err(error) => {
+                    last_error = Some(error.context(format!(
+                        "cache location {} could not serve approved narinfo",
+                        source.id
+                    )));
+                }
+            }
         }
-
-        let upstream_nar_url = self.resolve_nar_url(&narinfo.url)?;
-        let bytes = rewrite_nar_url(&bytes, &format!("nar/{store_hash}"))?;
-        Ok(Some(ApprovedNarInfo {
-            bytes,
-            upstream_nar_url,
-        }))
+        match last_error {
+            Some(error) => Err(error),
+            None => Ok(None),
+        }
     }
 
     pub async fn get_nar(
         &self,
         evidence: &EvidenceStore,
         store_hash: &str,
+        location_id: i64,
         round_config: RoundConfig,
     ) -> Result<Option<Response>> {
         let Some(approved) = self
-            .approved_by_hash(evidence, store_hash, round_config)
+            .approved_by_hash(evidence, store_hash, location_id, round_config)
             .await?
         else {
             return Ok(None);
@@ -101,10 +103,11 @@ impl BinaryCache {
         &self,
         evidence: &EvidenceStore,
         store_hash: &str,
+        location_id: i64,
         round_config: RoundConfig,
     ) -> Result<Option<Response>> {
         let Some(approved) = self
-            .approved_by_hash(evidence, store_hash, round_config)
+            .approved_by_hash(evidence, store_hash, location_id, round_config)
             .await?
         else {
             return Ok(None);
@@ -117,18 +120,62 @@ impl BinaryCache {
         &self,
         evidence: &EvidenceStore,
         store_hash: &str,
+        location_id: i64,
         round_config: RoundConfig,
     ) -> Result<Option<ApprovedNarInfo>> {
         if !valid_hash(store_hash) {
             return Ok(None);
         }
-        self.approved_narinfo(evidence, &format!("{store_hash}.narinfo"), round_config)
-            .await
+        let Some(approved) = evidence
+            .approved_output(store_hash, self.minimum_builders, round_config)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(source) = approved
+            .sources
+            .iter()
+            .find(|source| source.id == location_id)
+        else {
+            return Ok(None);
+        };
+        self.approved_from_source(
+            &approved,
+            source,
+            store_hash,
+            &format!("{store_hash}.narinfo"),
+        )
+        .await
     }
 
-    async fn get_narinfo(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        let url = self
-            .upstream
+    async fn approved_from_source(
+        &self,
+        approved: &ApprovedOutput,
+        source: &CacheSource,
+        store_hash: &str,
+        key: &str,
+    ) -> Result<Option<ApprovedNarInfo>> {
+        let upstream = Url::parse(&source.uri).context("stored cache location URI is invalid")?;
+        let Some(bytes) = self.get_narinfo(&upstream, key).await? else {
+            return Ok(None);
+        };
+        let narinfo = NarInfo::parse(&bytes)?;
+        if narinfo.store_hash() != Some(store_hash)
+            || narinfo.store_path != approved.store_path
+            || !narinfo.matches(&approved.fingerprint)
+        {
+            return Ok(None);
+        }
+        let upstream_nar_url = Self::resolve_nar_url(&upstream, &narinfo.url)?;
+        let bytes = rewrite_nar_url(&bytes, &format!("nar/{store_hash}/{}", source.id))?;
+        Ok(Some(ApprovedNarInfo {
+            bytes,
+            upstream_nar_url,
+        }))
+    }
+
+    async fn get_narinfo(&self, upstream: &Url, key: &str) -> Result<Option<Vec<u8>>> {
+        let url = upstream
             .join(key)
             .context("failed to construct upstream narinfo URL")?;
         let response = self
@@ -173,16 +220,15 @@ impl BinaryCache {
         Ok(Some(response))
     }
 
-    fn resolve_nar_url(&self, value: &str) -> Result<Url> {
-        let resolved = self
-            .upstream
+    fn resolve_nar_url(upstream: &Url, value: &str) -> Result<Url> {
+        let resolved = upstream
             .join(value)
             .context("narinfo contains an invalid URL")?;
-        let same_origin = resolved.scheme() == self.upstream.scheme()
-            && resolved.host_str() == self.upstream.host_str()
-            && resolved.port_or_known_default() == self.upstream.port_or_known_default();
-        if !same_origin || !resolved.path().starts_with(self.upstream.path()) {
-            bail!("narinfo URL escapes the configured upstream cache");
+        let same_origin = resolved.scheme() == upstream.scheme()
+            && resolved.host_str() == upstream.host_str()
+            && resolved.port_or_known_default() == upstream.port_or_known_default();
+        if !same_origin {
+            bail!("narinfo URL escapes the cache location origin");
         }
         Ok(resolved)
     }
@@ -256,27 +302,6 @@ impl NarInfo {
             && self.nar_size == fingerprint.nar_size
             && references == fingerprint.references
     }
-}
-
-fn normalize_upstream_url(value: &str) -> Result<Url> {
-    let mut url = Url::parse(value).context("invalid upstream cache URL")?;
-    if url.scheme() != "http" && url.scheme() != "https" {
-        bail!("upstream cache URL must use the http or https scheme");
-    }
-    if url.host_str().is_none() {
-        bail!("upstream cache URL must include a host");
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        bail!("upstream cache URL must not contain credentials");
-    }
-    if url.query().is_some() || url.fragment().is_some() {
-        bail!("upstream cache URL must not contain a query or fragment");
-    }
-    if !url.path().ends_with('/') {
-        let path = format!("{}/", url.path());
-        url.set_path(&path);
-    }
-    Ok(url)
 }
 
 fn rewrite_nar_url(bytes: &[u8], gateway_url: &str) -> Result<Vec<u8>> {
@@ -361,26 +386,12 @@ References: b-glibc a-libgcc\n";
     }
 
     #[test]
-    fn validates_and_normalizes_upstream_urls() {
-        assert_eq!(
-            normalize_upstream_url("https://cache.example.com/cache")
-                .unwrap()
-                .as_str(),
-            "https://cache.example.com/cache/"
-        );
-        assert!(normalize_upstream_url("s3://cache").is_err());
-        assert!(normalize_upstream_url("https://user:secret@cache.example.com").is_err());
-    }
-
-    #[test]
-    fn rejects_nar_urls_outside_the_upstream_cache() {
-        let cache =
-            BinaryCache::for_tests(Url::parse("https://cache.example.com/private/").unwrap(), 1);
-        assert!(cache.resolve_nar_url("nar/example.nar.xz").is_ok());
-        assert!(cache.resolve_nar_url("/nar/example.nar.xz").is_err());
+    fn rejects_nar_urls_outside_the_cache_origin() {
+        let upstream = Url::parse("https://cache.example.com/private/").unwrap();
+        assert!(BinaryCache::resolve_nar_url(&upstream, "nar/example.nar.xz").is_ok());
+        assert!(BinaryCache::resolve_nar_url(&upstream, "/nar/example.nar.xz").is_ok());
         assert!(
-            cache
-                .resolve_nar_url("https://evil.example/nar/example.nar.xz")
+            BinaryCache::resolve_nar_url(&upstream, "https://evil.example/nar/example.nar.xz")
                 .is_err()
         );
     }
