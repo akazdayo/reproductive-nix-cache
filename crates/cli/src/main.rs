@@ -11,8 +11,8 @@ use clap::{Parser, Subcommand};
 use client::Host;
 use serde::Serialize;
 use shared::{
-    CommitmentReceipt, CommitmentRequest, Evidence, EvidenceList, EvidenceReceipt, EvidenceReveal,
-    RoundPhase, RoundStatus, evidence_commitment, generate_nonce,
+    CacheLocation, CommitmentReceipt, CommitmentRequest, Evidence, EvidenceList, EvidenceReceipt,
+    EvidenceReveal, RoundPhase, RoundStatus, evidence_commitment, generate_nonce,
 };
 
 #[derive(Parser)]
@@ -34,6 +34,9 @@ enum Command {
         /// Host of the evidence registry, for example 127.0.0.1:3000 or example.com
         #[arg(long)]
         server: Host,
+        /// HTTP(S) Nix binary cache containing the built outputs; may be repeated
+        #[arg(long = "cache-location")]
+        cache_locations: Vec<String>,
         /// Suppress Nix build output
         #[arg(long)]
         quiet: bool,
@@ -69,6 +72,7 @@ async fn main() -> Result<()> {
             package_ref,
             builder_id,
             server,
+            cache_locations,
             quiet,
             substitute,
             claims,
@@ -115,7 +119,10 @@ async fn main() -> Result<()> {
                     round_id,
                     nonce,
                     evidence: evidence.clone(),
-                    cache_locations: Vec::new(),
+                    cache_locations: cache_locations
+                        .into_iter()
+                        .map(|uri| CacheLocation { uri })
+                        .collect(),
                 })
                 .await?;
             loop {
@@ -188,6 +195,34 @@ mod tests {
         .unwrap();
         let Command::Build { substitute, .. } = cli.command;
         assert!(substitute);
+    }
+
+    #[test]
+    fn build_accepts_multiple_cache_locations() {
+        let cli = Cli::try_parse_from([
+            "reproductive-nix-cache",
+            "build",
+            "nixpkgs#hello",
+            "--builder-id",
+            "builder-a",
+            "--server",
+            "127.0.0.1:3000",
+            "--cache-location",
+            "https://cache-a.example.com/builds",
+            "--cache-location",
+            "http://cache-b.example.com/",
+        ])
+        .unwrap();
+        let Command::Build {
+            cache_locations, ..
+        } = cli.command;
+        assert_eq!(
+            cache_locations,
+            vec![
+                "https://cache-a.example.com/builds",
+                "http://cache-b.example.com/"
+            ]
+        );
     }
 
     #[test]
