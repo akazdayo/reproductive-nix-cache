@@ -13,7 +13,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use shared::{
-    BuildCommand, BuildDispatchResponse, CommitmentReceipt, CommitmentRequest, EvidenceList,
+    BuildCommand, BuildQueueReceipt, CommitmentReceipt, CommitmentRequest, EvidenceList,
     EvidenceReceipt, EvidenceReveal, RoundStatus,
 };
 use std::sync::Arc;
@@ -95,7 +95,7 @@ async fn dispatch_build(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(command): Json<BuildCommand>,
-) -> ApiResult<(StatusCode, Json<BuildDispatchResponse>)> {
+) -> ApiResult<(StatusCode, Json<BuildQueueReceipt>)> {
     let manager = state
         .round_manager
         .as_ref()
@@ -109,13 +109,10 @@ async fn dispatch_build(
     }
     command.validate().map_err(ApiError::bad_request)?;
 
-    let response = manager.dispatch(&command).await;
-    let status = if response.has_success() {
-        StatusCode::OK
-    } else {
-        StatusCode::BAD_GATEWAY
-    };
-    Ok((status, Json(response)))
+    let receipt = manager
+        .enqueue(command)
+        .map_err(ApiError::service_unavailable)?;
+    Ok((StatusCode::ACCEPTED, Json(receipt)))
 }
 
 fn authorized(headers: &HeaderMap, expected: &str) -> bool {
@@ -729,7 +726,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn round_manager_enforces_auth_validates_commands_and_maps_results() {
+    async fn round_manager_enforces_auth_validates_commands_and_queues_work() {
         let command = BuildCommand {
             package_ref: "nixpkgs#hello".into(),
             substitute: false,
@@ -750,7 +747,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         let node = spawn_builder_node(StatusCode::OK).await;
-        let manager = RoundManager::new(vec![node], "builder-secret".into()).unwrap();
+        let manager = RoundManager::new(vec![node], "builder-secret".into(), 64).unwrap();
         let app = router(
             AppState::in_memory()
                 .await
@@ -800,11 +797,15 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(successful.status(), StatusCode::OK);
+        assert_eq!(successful.status(), StatusCode::ACCEPTED);
+        let body = to_bytes(successful.into_body(), usize::MAX).await.unwrap();
+        let receipt: BuildQueueReceipt = serde_json::from_slice(&body).unwrap();
+        assert_eq!(receipt.job_id, 1);
+        assert!(receipt.queued);
 
         let failing_node = spawn_builder_node(StatusCode::CONFLICT).await;
         let failing_manager =
-            RoundManager::new(vec![failing_node], "builder-secret".into()).unwrap();
+            RoundManager::new(vec![failing_node], "builder-secret".into(), 64).unwrap();
         let failing = router(
             AppState::in_memory()
                 .await
@@ -823,7 +824,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(failed.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(failed.status(), StatusCode::ACCEPTED);
     }
 
     #[tokio::test]

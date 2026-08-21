@@ -68,6 +68,12 @@ pub struct BuildNodeReceipt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildQueueReceipt {
+    pub job_id: u64,
+    pub queued: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildDispatchOutcome {
     pub node: String,
     pub success: bool,

@@ -34,6 +34,10 @@ pub struct Cli {
     #[arg(long = "builder-node")]
     pub builder_nodes: Vec<Url>,
 
+    /// Maximum number of build commands waiting for the round manager worker
+    #[arg(long, env = "NIX_CACHE_BUILD_QUEUE_CAPACITY", default_value_t = 64)]
+    pub build_queue_capacity: usize,
+
     /// Token required from clients of the round manager endpoint
     #[arg(long, env = "NIX_CACHE_MANAGER_TOKEN", hide_env_values = true)]
     pub manager_token: Option<String>,

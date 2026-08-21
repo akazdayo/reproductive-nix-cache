@@ -3,7 +3,8 @@ pub mod commitment;
 pub mod evidence;
 
 pub use build::{
-    BuildCommand, BuildDispatchOutcome, BuildDispatchResponse, BuildNodeReceipt, ClaimKind,
+    BuildCommand, BuildDispatchOutcome, BuildDispatchResponse, BuildNodeReceipt, BuildQueueReceipt,
+    ClaimKind,
 };
 pub use commitment::{
     COMMITMENT_NONCE_BYTES, CacheLocation, CommitmentReceipt, CommitmentRequest, EvidenceReveal,

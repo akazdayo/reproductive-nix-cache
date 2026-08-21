@@ -53,6 +53,7 @@ $ NIX_CACHE_BUILDER_TOKEN=builder-secret \
 $ NIX_CACHE_MANAGER_TOKEN=manager-secret \
   NIX_CACHE_BUILDER_TOKEN=builder-secret \
   cargo run -p server -- \
+    --build-queue-capacity 64 \
     --builder-node http://builder-a.internal:51338 \
     --builder-node http://builder-b.internal:51338
 ```
@@ -62,10 +63,15 @@ $ curl -X POST http://127.0.0.1:51337/v1/builds \
     -H 'Authorization: Bearer manager-secret' \
     -H 'Content-Type: application/json' \
     -d '{"package_ref":"nixpkgs#hello","substitute":false,"claims":[]}'
+# => HTTP 202 {"job_id":1,"queued":true}
 ```
 
-Round Managerは同じJSONを全Nodeへ並列送信し、全Nodeの処理完了後に結果を集約して
-返します。初期版は同期実行で、各Nodeは同時に1ビルドだけ受け付けます。
+Round Managerは要求をメモリ上のFIFOキューへ入れ、ビルド完了を待たずに
+`202 Accepted`を返します。単一workerが要求を順番に取り出し、同じJSONを全Nodeへ
+並列送信します。Nodeごとの成功・失敗、`builder_id`、round ID、Evidence IDは
+serverの標準エラー出力へ表示されます。キューは永続化されないため、serverを
+再起動すると待機中の要求は失われます。キュー満杯時は`503 Service Unavailable`を
+返します。各Nodeは同時に1ビルドだけ受け付けます。
 各NodeはEvidence完成後にcommitするため、Node間のビルド完了時刻の差が
 `--commit-window-seconds` を超えないよう、実際のビルド時間に合わせてwindowを
 設定してください。
