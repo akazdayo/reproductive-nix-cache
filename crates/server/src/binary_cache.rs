@@ -86,11 +86,12 @@ impl BinaryCache {
         &self,
         evidence: &EvidenceStore,
         store_hash: &str,
+        round_id: i64,
         location_id: i64,
         round_config: RoundConfig,
     ) -> Result<Option<Response>> {
         let Some(approved) = self
-            .approved_by_hash(evidence, store_hash, location_id, round_config)
+            .approved_by_hash(evidence, store_hash, round_id, location_id, round_config)
             .await?
         else {
             return Ok(None);
@@ -103,11 +104,12 @@ impl BinaryCache {
         &self,
         evidence: &EvidenceStore,
         store_hash: &str,
+        round_id: i64,
         location_id: i64,
         round_config: RoundConfig,
     ) -> Result<Option<Response>> {
         let Some(approved) = self
-            .approved_by_hash(evidence, store_hash, location_id, round_config)
+            .approved_by_hash(evidence, store_hash, round_id, location_id, round_config)
             .await?
         else {
             return Ok(None);
@@ -120,6 +122,7 @@ impl BinaryCache {
         &self,
         evidence: &EvidenceStore,
         store_hash: &str,
+        round_id: i64,
         location_id: i64,
         round_config: RoundConfig,
     ) -> Result<Option<ApprovedNarInfo>> {
@@ -127,7 +130,7 @@ impl BinaryCache {
             return Ok(None);
         }
         let Some(approved) = evidence
-            .approved_output(store_hash, self.minimum_builders, round_config)
+            .approved_output_in_round(store_hash, round_id, self.minimum_builders, round_config)
             .await?
         else {
             return Ok(None);
@@ -167,7 +170,10 @@ impl BinaryCache {
             return Ok(None);
         }
         let upstream_nar_url = Self::resolve_nar_url(&upstream, &narinfo.url)?;
-        let bytes = rewrite_nar_url(&bytes, &format!("nar/{store_hash}/{}", source.id))?;
+        let bytes = rewrite_nar_url(
+            &bytes,
+            &format!("nar/{store_hash}/{}/{}", approved.round_id, source.id),
+        )?;
         Ok(Some(ApprovedNarInfo {
             bytes,
             upstream_nar_url,

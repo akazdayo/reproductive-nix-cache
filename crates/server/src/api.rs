@@ -63,7 +63,7 @@ pub fn router(state: AppState) -> Router {
             get(binary_cache_info).head(binary_cache_info_head),
         )
         .route(
-            "/nar/{store_hash}/{location_id}",
+            "/nar/{store_hash}/{round_id}/{location_id}",
             get(get_nar).head(head_nar),
         )
         .route("/{key}", get(get_narinfo).head(head_narinfo))
@@ -216,13 +216,19 @@ async fn narinfo_response(state: &AppState, key: &str, head_only: bool) -> Respo
 
 async fn get_nar(
     State(state): State<AppState>,
-    Path((store_hash, location_id)): Path<(String, i64)>,
+    Path((store_hash, round_id, location_id)): Path<(String, i64, i64)>,
 ) -> Response {
     let Some(cache) = &state.binary_cache else {
         return StatusCode::NOT_FOUND.into_response();
     };
     match cache
-        .get_nar(&state.store, &store_hash, location_id, state.round_config)
+        .get_nar(
+            &state.store,
+            &store_hash,
+            round_id,
+            location_id,
+            state.round_config,
+        )
         .await
     {
         Ok(Some(result)) => {
@@ -246,13 +252,19 @@ async fn get_nar(
 
 async fn head_nar(
     State(state): State<AppState>,
-    Path((store_hash, location_id)): Path<(String, i64)>,
+    Path((store_hash, round_id, location_id)): Path<(String, i64, i64)>,
 ) -> Response {
     let Some(cache) = &state.binary_cache else {
         return StatusCode::NOT_FOUND.into_response();
     };
     match cache
-        .head_nar(&state.store, &store_hash, location_id, state.round_config)
+        .head_nar(
+            &state.store,
+            &store_hash,
+            round_id,
+            location_id,
+            state.round_config,
+        )
         .await
     {
         Ok(Some(result)) => {
@@ -573,6 +585,21 @@ mod tests {
     ) -> Router {
         let store = EvidenceStore::in_memory().await.unwrap();
         let round_config = test_round_config(submissions.len().max(1));
+        if !submissions.is_empty() {
+            reveal_cache_round(&store, round_config, submissions).await;
+        }
+        let state = AppState::new(store)
+            .with_round_config(round_config)
+            .with_binary_cache(BinaryCache::for_tests(minimum_builders));
+        router(state)
+    }
+
+    async fn reveal_cache_round(
+        store: &EvidenceStore,
+        round_config: RoundConfig,
+        submissions: Vec<(Evidence, Vec<reqwest::Url>)>,
+    ) -> i64 {
+        assert!(!submissions.is_empty());
         let mut reveals = Vec::new();
         for (evidence, locations) in submissions {
             let nonce = generate_nonce().unwrap();
@@ -582,6 +609,7 @@ mod tests {
                 .unwrap();
             reveals.push((receipt.round.id, nonce, evidence, locations));
         }
+        let round_id = reveals[0].0;
         for (round_id, nonce, evidence, locations) in reveals {
             store
                 .reveal(
@@ -601,10 +629,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let state = AppState::new(store)
-            .with_round_config(round_config)
-            .with_binary_cache(BinaryCache::for_tests(minimum_builders));
-        router(state)
+        round_id
     }
 
     async fn cache_app(minimum_builders: usize, evidence: Vec<Evidence>) -> Router {
@@ -814,8 +839,76 @@ mod tests {
             to_bytes(response.into_body(), usize::MAX).await.unwrap(),
             narinfo(CACHE_NAR_HASH_NIX32).replace(
                 "URL: nar/example.nar.xz",
-                &format!("URL: nar/{CACHE_HASH}/1"),
+                &format!("URL: nar/{CACHE_HASH}/1/1"),
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn issued_nar_url_remains_valid_after_a_later_round_closes() {
+        let upstream = spawn_upstream(narinfo(CACHE_NAR_HASH_NIX32)).await;
+        let store = EvidenceStore::in_memory().await.unwrap();
+        let round_config = test_round_config(2);
+        let submissions = || {
+            vec![
+                (
+                    cache_evidence("builder-a", CACHE_NAR_HASH_SRI),
+                    vec![upstream.clone()],
+                ),
+                (
+                    cache_evidence("builder-b", CACHE_NAR_HASH_SRI),
+                    vec![upstream.clone()],
+                ),
+            ]
+        };
+        let first_round = reveal_cache_round(&store, round_config, submissions()).await;
+        let app = router(
+            AppState::new(store.clone())
+                .with_round_config(round_config)
+                .with_binary_cache(BinaryCache::for_tests(2)),
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/{CACHE_HASH}.narinfo"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let narinfo = String::from_utf8(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let issued_nar_url = narinfo
+            .lines()
+            .find_map(|line| line.strip_prefix("URL: "))
+            .unwrap()
+            .to_owned();
+        assert_eq!(issued_nar_url, format!("nar/{CACHE_HASH}/{first_round}/1"));
+
+        let second_round = reveal_cache_round(&store, round_config, submissions()).await;
+        assert_ne!(second_round, first_round);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/{issued_nar_url}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+            "compressed nar"
         );
     }
 
@@ -877,7 +970,7 @@ mod tests {
                 .to_vec(),
         )
         .unwrap();
-        assert!(body.contains(&format!("URL: nar/{CACHE_HASH}/2\n")));
+        assert!(body.contains(&format!("URL: nar/{CACHE_HASH}/1/2\n")));
     }
 
     #[tokio::test]
@@ -921,8 +1014,8 @@ mod tests {
                 .to_vec(),
         )
         .unwrap();
-        assert!(body.contains(&format!("URL: nar/{CACHE_HASH}/2\n")));
-        assert!(!body.contains(&format!("URL: nar/{CACHE_HASH}/1\n")));
+        assert!(body.contains(&format!("URL: nar/{CACHE_HASH}/1/2\n")));
+        assert!(!body.contains(&format!("URL: nar/{CACHE_HASH}/1/1\n")));
     }
 
     #[tokio::test]
@@ -967,7 +1060,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri(format!("/nar/{CACHE_HASH}/1"))
+                    .uri(format!("/nar/{CACHE_HASH}/1/1"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -984,7 +1077,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("HEAD")
-                    .uri(format!("/nar/{CACHE_HASH}/1"))
+                    .uri(format!("/nar/{CACHE_HASH}/1/1"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1064,7 +1157,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri(format!("/nar/{CACHE_HASH}/1"))
+                    .uri(format!("/nar/{CACHE_HASH}/1/1"))
                     .body(Body::empty())
                     .unwrap(),
             )

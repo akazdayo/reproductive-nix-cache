@@ -86,6 +86,7 @@ pub struct CacheSource {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovedOutput {
+    pub round_id: i64,
     pub store_path: String,
     pub fingerprint: OutputFingerprint,
     pub sources: Vec<CacheSource>,
@@ -808,6 +809,28 @@ impl EvidenceStore {
         minimum_builders: usize,
         config: RoundConfig,
     ) -> Result<Option<ApprovedOutput>> {
+        self.approved_output_for_round(store_hash, None, minimum_builders, config)
+            .await
+    }
+
+    pub async fn approved_output_in_round(
+        &self,
+        store_hash: &str,
+        round_id: i64,
+        minimum_builders: usize,
+        config: RoundConfig,
+    ) -> Result<Option<ApprovedOutput>> {
+        self.approved_output_for_round(store_hash, Some(round_id), minimum_builders, config)
+            .await
+    }
+
+    async fn approved_output_for_round(
+        &self,
+        store_hash: &str,
+        round_id: Option<i64>,
+        minimum_builders: usize,
+        config: RoundConfig,
+    ) -> Result<Option<ApprovedOutput>> {
         let output_rows = build_output_entity::Entity::find()
             .filter(
                 build_output_entity::Column::OutputStorePath
@@ -816,8 +839,8 @@ impl EvidenceStore {
             .all(&self.database)
             .await
             .context("failed to query build output evidence by store hash")?;
-        let Some((variant, evidence_ids)) = self
-            .select_output_consensus(output_rows, minimum_builders, config)
+        let Some((approved_round_id, variant, evidence_ids)) = self
+            .select_output_consensus(output_rows, round_id, minimum_builders, config)
             .await?
         else {
             return Ok(None);
@@ -831,6 +854,7 @@ impl EvidenceStore {
             .context("failed to query approved cache locations")?;
 
         Ok(Some(ApprovedOutput {
+            round_id: approved_round_id,
             store_path: variant.store_path,
             fingerprint: variant.fingerprint,
             sources: locations
@@ -846,9 +870,10 @@ impl EvidenceStore {
     async fn select_output_consensus(
         &self,
         output_rows: Vec<build_output_entity::Model>,
+        requested_round_id: Option<i64>,
         minimum_builders: usize,
         config: RoundConfig,
-    ) -> Result<Option<(OutputVariant, Vec<i64>)>> {
+    ) -> Result<Option<(i64, OutputVariant, Vec<i64>)>> {
         let mut facts = Vec::new();
         let mut round_ids = BTreeSet::new();
         for output in output_rows {
@@ -879,6 +904,9 @@ impl EvidenceStore {
 
         let mut latest: Option<(chrono::DateTime<Utc>, i64)> = None;
         for round_id in round_ids {
+            if requested_round_id.is_some_and(|requested| requested != round_id) {
+                continue;
+            }
             let Some(model) = round::Entity::find_by_id(round_id)
                 .one(&self.database)
                 .await
@@ -946,7 +974,11 @@ impl EvidenceStore {
             return Ok(None);
         }
 
-        Ok(Some((fingerprint, builders.into_values().collect())))
+        Ok(Some((
+            latest_round_id,
+            fingerprint,
+            builders.into_values().collect(),
+        )))
     }
 
     async fn find_by_id(&self, id: i64) -> Result<Option<StoredEvidence>> {
@@ -1380,7 +1412,7 @@ mod tests {
             .unwrap();
         assert!(
             store
-                .select_output_consensus(output_rows, 2, config)
+                .select_output_consensus(output_rows, None, 2, config)
                 .await
                 .unwrap()
                 .is_none()
