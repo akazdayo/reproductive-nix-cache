@@ -32,6 +32,10 @@ impl BinaryCache {
         })
     }
 
+    pub fn minimum_builders(&self) -> usize {
+        self.minimum_builders
+    }
+
     #[cfg(test)]
     pub fn for_tests(minimum_builders: usize) -> Self {
         Self {

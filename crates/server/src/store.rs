@@ -116,6 +116,17 @@ pub struct EvidenceStore {
     database: DatabaseConnection,
 }
 
+pub struct MetricsSnapshot {
+    pub rounds: Vec<round::Model>,
+    pub commitments: Vec<commitment::Model>,
+    pub evidences: Vec<evidence_entity::Model>,
+    pub cache_locations: Vec<cache_location::Model>,
+    pub claims: Vec<claim::Model>,
+    pub build_claims: Vec<build_claim::Model>,
+    pub build_outputs: Vec<build_output_entity::Model>,
+    pub log_claims: Vec<log_claim::Model>,
+}
+
 impl EvidenceStore {
     pub async fn open(path: &Path) -> Result<Self> {
         let absolute_path = if path.is_absolute() {
@@ -882,6 +893,59 @@ impl EvidenceStore {
             derivation_path: round.derivation_path,
             evidences,
         }))
+    }
+
+    pub async fn metrics_snapshot(&self, config: RoundConfig) -> Result<MetricsSnapshot> {
+        let now = Utc::now();
+        let open_rounds = round::Entity::find()
+            .filter(round::Column::ClosedAt.is_null())
+            .all(&self.database)
+            .await
+            .context("failed to query open rounds for metrics")?;
+        for model in open_rounds {
+            self.advance_round(model, now, config)
+                .await
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        }
+
+        let transaction = self.database.begin().await?;
+        let snapshot = MetricsSnapshot {
+            rounds: round::Entity::find()
+                .order_by_asc(round::Column::Id)
+                .all(&transaction)
+                .await?,
+            commitments: commitment::Entity::find()
+                .order_by_asc(commitment::Column::Id)
+                .all(&transaction)
+                .await?,
+            evidences: evidence_entity::Entity::find()
+                .order_by_asc(evidence_entity::Column::Id)
+                .all(&transaction)
+                .await?,
+            cache_locations: cache_location::Entity::find()
+                .order_by_asc(cache_location::Column::Id)
+                .all(&transaction)
+                .await?,
+            claims: claim::Entity::find()
+                .order_by_asc(claim::Column::Id)
+                .all(&transaction)
+                .await?,
+            build_claims: build_claim::Entity::find()
+                .order_by_asc(build_claim::Column::ClaimId)
+                .all(&transaction)
+                .await?,
+            build_outputs: build_output_entity::Entity::find()
+                .order_by_asc(build_output_entity::Column::ClaimId)
+                .order_by_asc(build_output_entity::Column::Position)
+                .all(&transaction)
+                .await?,
+            log_claims: log_claim::Entity::find()
+                .order_by_asc(log_claim::Column::ClaimId)
+                .all(&transaction)
+                .await?,
+        };
+        transaction.commit().await?;
+        Ok(snapshot)
     }
 
     pub async fn approved_output(

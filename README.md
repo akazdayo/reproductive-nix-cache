@@ -83,6 +83,27 @@ serverの標準エラー出力へ表示されます。キューは永続化さ�
 `--commit-window-seconds` を超えないよう、実際のビルド時間に合わせてwindowを
 設定してください。
 
+## Prometheus metrics
+
+`GET /metrics` は認証なしで Prometheus text format を返します。
+
+```console
+$ curl http://127.0.0.1:51337/metrics
+```
+
+起動設定、HTTP件数と所要時間、build queue、Builder Nodeごとの実行結果、SQLiteの
+全テーブルを公開します。保存済みの文字列は `*_info` のlabelになり、Evidenceの
+stdout/stderr、commitment digest、reveal済みnonce、cache URIも含まれます。そのため
+scrape先では全情報を取得できる前提で運用し、履歴が増えるほど時系列数とresponse sizeも
+増えることに注意してください。
+
+```yaml
+scrape_configs:
+  - job_name: reproductive-nix-cache
+    static_configs:
+      - targets: ["127.0.0.1:51337"]
+```
+
 ## Nix Binary Cache として使う
 
 ```nix

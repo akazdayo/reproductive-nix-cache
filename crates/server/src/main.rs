@@ -4,6 +4,7 @@ mod cache_location;
 mod cli;
 mod config;
 mod entity;
+mod metrics;
 mod round_manager;
 mod store;
 use anyhow::bail;
@@ -46,7 +47,11 @@ async fn main() -> anyhow::Result<()> {
     let builder_node_count = cli.builder_nodes.len();
     let mut state = api::AppState::new(store)
         .with_round_config(round_config)
-        .with_binary_cache(cache);
+        .with_binary_cache(cache)
+        .with_server_metadata(metrics::ServerMetadata {
+            listen: listen.to_string(),
+            database: database.display().to_string(),
+        });
     if !cli.builder_nodes.is_empty() {
         if cli.builder_nodes.len() < cli.commit_min_builders {
             bail!(
