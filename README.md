@@ -45,8 +45,7 @@ Evidenceをcommit/revealします。Builder固有のID、registry、cache locati
 Node側に固定され、ビルド命令から上書きできません。
 
 ```console
-$ NIX_CACHE_BUILDER_TOKEN=builder-secret \
-  cargo run -p builder-node -- \
+$ cargo run -p builder-node -- \
     --listen 0.0.0.0:51338 \
     --builder-id builder-a \
     --server 127.0.0.1:51337 \
@@ -57,9 +56,7 @@ $ NIX_CACHE_BUILDER_TOKEN=builder-secret \
 設定したNode数は `--commit-min-builders` 以上である必要があります。
 
 ```console
-$ NIX_CACHE_MANAGER_TOKEN=manager-secret \
-  NIX_CACHE_BUILDER_TOKEN=builder-secret \
-  cargo run -p server -- \
+$ cargo run -p server -- \
     --build-queue-capacity 64 \
     --builder-node http://builder-a.internal:51338 \
     --builder-node http://builder-b.internal:51338
@@ -67,7 +64,6 @@ $ NIX_CACHE_MANAGER_TOKEN=manager-secret \
 
 ```console
 $ curl -X POST http://127.0.0.1:51337/v1/builds \
-    -H 'Authorization: Bearer manager-secret' \
     -H 'Content-Type: application/json' \
     -d '{"package_ref":"nixpkgs#hello","substitute":false,"claims":[]}'
 # => HTTP 202 {"job_id":1,"queued":true}

@@ -26,7 +26,6 @@ pub struct RoundManager {
 
 struct Dispatcher {
     nodes: Arc<[Url]>,
-    token: Arc<str>,
     client: Client,
 }
 
@@ -100,11 +99,11 @@ impl fmt::Display for EnqueueError {
 impl std::error::Error for EnqueueError {}
 
 impl RoundManager {
-    pub fn new(nodes: Vec<Url>, token: String, queue_capacity: usize) -> Result<Self> {
+    pub fn new(nodes: Vec<Url>, queue_capacity: usize) -> Result<Self> {
         if queue_capacity == 0 {
             bail!("build queue capacity must be at least 1");
         }
-        let dispatcher = Dispatcher::new(nodes, token)?;
+        let dispatcher = Dispatcher::new(nodes)?;
         let metrics = Arc::new(Mutex::new(RuntimeMetrics {
             nodes: dispatcher
                 .nodes
@@ -197,12 +196,9 @@ fn lock_metrics(metrics: &Mutex<RuntimeMetrics>) -> MutexGuard<'_, RuntimeMetric
 }
 
 impl Dispatcher {
-    fn new(nodes: Vec<Url>, token: String) -> Result<Self> {
+    fn new(nodes: Vec<Url>) -> Result<Self> {
         if nodes.is_empty() {
             bail!("round manager requires at least one builder node");
-        }
-        if token.is_empty() {
-            bail!("builder node token must not be empty");
         }
         let mut unique = BTreeSet::new();
         for node in &nodes {
@@ -227,7 +223,6 @@ impl Dispatcher {
             .build()?;
         Ok(Self {
             nodes: nodes.into(),
-            token: token.into(),
             client,
         })
     }
@@ -236,10 +231,9 @@ impl Dispatcher {
         let mut tasks = Vec::with_capacity(self.nodes.len());
         for node in self.nodes.iter().cloned() {
             let client = self.client.clone();
-            let token = Arc::clone(&self.token);
             let command = command.clone();
             tasks.push(tokio::spawn(async move {
-                dispatch_one(client, node, token, command).await
+                dispatch_one(client, node, command).await
             }));
         }
 
@@ -325,24 +319,13 @@ async fn run_worker(
     }
 }
 
-async fn dispatch_one(
-    client: Client,
-    node: Url,
-    token: Arc<str>,
-    command: BuildCommand,
-) -> BuildDispatchOutcome {
+async fn dispatch_one(client: Client, node: Url, command: BuildCommand) -> BuildDispatchOutcome {
     let node_name = node.to_string();
     let endpoint = match node.join("v1/builds") {
         Ok(endpoint) => endpoint,
         Err(error) => return BuildDispatchOutcome::failed(node_name, error.to_string()),
     };
-    let response = match client
-        .post(endpoint)
-        .bearer_auth(token.as_ref())
-        .json(&command)
-        .send()
-        .await
-    {
+    let response = match client.post(endpoint).json(&command).send().await {
         Ok(response) => response,
         Err(error) => {
             return BuildDispatchOutcome::failed(
@@ -381,12 +364,7 @@ async fn dispatch_one(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{
-        Json, Router,
-        http::{HeaderMap, StatusCode, header},
-        response::IntoResponse,
-        routing::post,
-    };
+    use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};
     use std::sync::{
         Mutex,
         atomic::{AtomicBool, Ordering},
@@ -400,20 +378,14 @@ mod tests {
     ) -> Url {
         let app = Router::new().route(
             "/v1/builds",
-            post(
-                move |headers: HeaderMap, Json(command): Json<BuildCommand>| {
-                    let received = Arc::clone(&received);
-                    let receipt = receipt.clone();
-                    async move {
-                        assert_eq!(
-                            headers.get(header::AUTHORIZATION).unwrap(),
-                            "Bearer builder-secret"
-                        );
-                        received.lock().unwrap().push(command);
-                        (status, Json(receipt)).into_response()
-                    }
-                },
-            ),
+            post(move |Json(command): Json<BuildCommand>| {
+                let received = Arc::clone(&received);
+                let receipt = receipt.clone();
+                async move {
+                    received.lock().unwrap().push(command);
+                    (status, Json(receipt)).into_response()
+                }
+            }),
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -444,7 +416,7 @@ mod tests {
             Arc::clone(&received),
         )
         .await;
-        let dispatcher = Dispatcher::new(vec![first, second], "builder-secret".into()).unwrap();
+        let dispatcher = Dispatcher::new(vec![first, second]).unwrap();
         let command = BuildCommand {
             package_ref: "nixpkgs#hello".into(),
             substitute: false,
@@ -491,7 +463,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let node = Url::parse(&format!("http://{address}/")).unwrap();
-        let manager = RoundManager::new(vec![node], "builder-secret".into(), 1).unwrap();
+        let manager = RoundManager::new(vec![node], 1).unwrap();
         let command = BuildCommand {
             package_ref: "nixpkgs#hello".into(),
             substitute: false,
@@ -522,9 +494,9 @@ mod tests {
     #[test]
     fn rejects_unsafe_builder_node_urls() {
         let url = Url::parse("https://user:secret@example.com/path").unwrap();
-        assert!(Dispatcher::new(vec![url], "token".into()).is_err());
+        assert!(Dispatcher::new(vec![url]).is_err());
 
         let url = Url::parse("https://builder.example.com/").unwrap();
-        assert!(Dispatcher::new(vec![url.clone(), url], "token".into()).is_err());
+        assert!(Dispatcher::new(vec![url.clone(), url]).is_err());
     }
 }
