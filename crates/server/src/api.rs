@@ -21,6 +21,8 @@ use shared::{
 use std::time::Instant;
 use tracing::warn;
 
+const UNMATCHED_ROUTE: &str = "unmatched";
+
 #[derive(Clone)]
 pub struct AppState {
     store: EvidenceStore,
@@ -129,12 +131,12 @@ async fn record_http_metrics(
         .extensions()
         .get::<MatchedPath>()
         .map(MatchedPath::as_str)
-        .unwrap_or_else(|| request.uri().path())
+        .unwrap_or(UNMATCHED_ROUTE)
         .to_owned();
-    metrics.begin_request();
+    let _active_request = metrics.begin_request();
     let started_at = Instant::now();
     let response = next.run(request).await;
-    metrics.finish_request(
+    metrics.observe_request(
         &method,
         &route,
         response.status().as_u16(),
@@ -1494,5 +1496,41 @@ mod tests {
                 "missing metric: {expected}\n{body}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn metrics_collapses_unmatched_paths_into_one_label() {
+        let app = router(AppState::in_memory().await.unwrap());
+        for path in ["/missing/one", "/missing/two"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+
+        assert!(body.contains(
+            "reproductive_nix_cache_http_requests_total{method=\"GET\",route=\"unmatched\",status=\"404\"} 2"
+        ));
+        assert!(!body.contains("/missing/one"));
+        assert!(!body.contains("/missing/two"));
     }
 }

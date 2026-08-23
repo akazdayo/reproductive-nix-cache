@@ -23,6 +23,11 @@ pub struct HttpMetrics {
     inner: Arc<HttpMetricsInner>,
 }
 
+#[must_use = "the guard must be held until request processing finishes"]
+pub(crate) struct ActiveRequestGuard {
+    inner: Arc<HttpMetricsInner>,
+}
+
 struct HttpMetricsInner {
     started_at: SystemTime,
     active: AtomicU64,
@@ -70,12 +75,20 @@ impl Default for HttpMetrics {
 }
 
 impl HttpMetrics {
-    pub fn begin_request(&self) {
+    pub(crate) fn begin_request(&self) -> ActiveRequestGuard {
         self.inner.active.fetch_add(1, Ordering::Relaxed);
+        ActiveRequestGuard {
+            inner: Arc::clone(&self.inner),
+        }
     }
 
-    pub fn finish_request(&self, method: &str, route: &str, status: u16, duration: Duration) {
-        self.inner.active.fetch_sub(1, Ordering::Relaxed);
+    pub(crate) fn observe_request(
+        &self,
+        method: &str,
+        route: &str,
+        status: u16,
+        duration: Duration,
+    ) {
         let mut observations = lock(&self.inner.observations);
         let observation = observations
             .entry(HttpLabels {
@@ -86,6 +99,12 @@ impl HttpMetrics {
             .or_default();
         observation.requests += 1;
         observation.duration += duration;
+    }
+}
+
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        self.inner.active.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -931,5 +950,20 @@ mod tests {
     #[test]
     fn escapes_prometheus_label_values() {
         assert_eq!(escape_label("a\\b\n\"c\""), "a\\\\b\\n\\\"c\\\"");
+    }
+
+    #[test]
+    fn active_request_guard_decrements_when_dropped() {
+        let metrics = HttpMetrics::default();
+        assert_eq!(metrics.inner.active.load(Ordering::Relaxed), 0);
+
+        let guard = metrics.begin_request();
+        assert_eq!(metrics.inner.active.load(Ordering::Relaxed), 1);
+
+        metrics.observe_request("GET", "/", 200, Duration::from_millis(1));
+        assert_eq!(metrics.inner.active.load(Ordering::Relaxed), 1);
+
+        drop(guard);
+        assert_eq!(metrics.inner.active.load(Ordering::Relaxed), 0);
     }
 }
