@@ -103,16 +103,17 @@ scrape_configs:
 ## Grafana dashboard
 
 `monitoring/compose.yaml` で Prometheus と Grafana を起動できます。server は先に
-`127.0.0.1:51337` で起動してください。Docker の host network を使うため、server と
-各Web UIはlocalhostの外へ公開されません。
+`127.0.0.1:51337` で起動してください。Docker の host network を使い、server と
+Prometheusはlocalhost限定、Grafanaは全network interfaceの3000番portで待ち受けます。
 
 ```console
 $ docker compose -f monitoring/compose.yaml up -d
 ```
 
-Grafana は <http://127.0.0.1:3000/d/reproductive-nix-cache/reproductive-nix-cache>、
+Grafana は `http://<server-address>:3000/d/reproductive-nix-cache/reproductive-nix-cache`、
 Prometheus は <http://127.0.0.1:9090> です。Grafana の初期ログインは
-`admin` / `admin` です。永続volumeを初めて作る前なら、管理者パスワードを変更できます。
+`admin` / `admin` です。外部から到達できるため、firewallで公開範囲を制限し、
+永続volumeを初めて作る前に管理者パスワードを変更してください。
 
 ```console
 $ GRAFANA_ADMIN_PASSWORD='replace-me' \
