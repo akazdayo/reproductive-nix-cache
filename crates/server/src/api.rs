@@ -7,7 +7,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{DefaultBodyLimit, Path, Query, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -16,7 +16,6 @@ use shared::{
     BuildCommand, BuildQueueReceipt, CommitmentReceipt, CommitmentRequest, EvidenceList,
     EvidenceReceipt, EvidenceReveal, RoundStatus,
 };
-use std::sync::Arc;
 use tracing::warn;
 
 #[derive(Clone)]
@@ -25,7 +24,6 @@ pub struct AppState {
     binary_cache: Option<BinaryCache>,
     round_config: RoundConfig,
     round_manager: Option<RoundManager>,
-    manager_token: Option<Arc<str>>,
 }
 
 impl AppState {
@@ -35,7 +33,6 @@ impl AppState {
             binary_cache: None,
             round_config: RoundConfig::default(),
             round_manager: None,
-            manager_token: None,
         }
     }
 
@@ -49,13 +46,8 @@ impl AppState {
         self
     }
 
-    pub fn with_round_manager(
-        mut self,
-        round_manager: RoundManager,
-        manager_token: String,
-    ) -> Self {
+    pub fn with_round_manager(mut self, round_manager: RoundManager) -> Self {
         self.round_manager = Some(round_manager);
-        self.manager_token = Some(manager_token.into());
         self
     }
 
@@ -94,34 +86,18 @@ async fn health() -> &'static str {
 
 async fn dispatch_build(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(command): Json<BuildCommand>,
 ) -> ApiResult<(StatusCode, Json<BuildQueueReceipt>)> {
     let manager = state
         .round_manager
         .as_ref()
         .ok_or_else(|| ApiError::service_unavailable("no builder nodes are configured"))?;
-    let token = state
-        .manager_token
-        .as_deref()
-        .ok_or_else(|| ApiError::internal("round manager token is missing"))?;
-    if !authorized(&headers, token) {
-        return Err(ApiError::unauthorized("invalid bearer token"));
-    }
     command.validate().map_err(ApiError::bad_request)?;
 
     let receipt = manager
         .enqueue(command)
         .map_err(ApiError::service_unavailable)?;
     Ok((StatusCode::ACCEPTED, Json(receipt)))
-}
-
-fn authorized(headers: &HeaderMap, expected: &str) -> bool {
-    headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|token| !expected.is_empty() && token == expected)
 }
 
 async fn commit_evidence(
@@ -361,13 +337,6 @@ impl ApiError {
         }
     }
 
-    fn unauthorized(error: impl std::fmt::Display) -> Self {
-        Self {
-            status: StatusCode::UNAUTHORIZED,
-            message: error.to_string(),
-        }
-    }
-
     fn service_unavailable(error: impl std::fmt::Display) -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -554,22 +523,16 @@ mod tests {
     async fn spawn_builder_node(status: StatusCode) -> reqwest::Url {
         let app = Router::new().route(
             "/v1/builds",
-            post(
-                move |headers: HeaderMap, Json(_): Json<BuildCommand>| async move {
-                    assert_eq!(
-                        headers.get(header::AUTHORIZATION).unwrap(),
-                        "Bearer builder-secret"
-                    );
-                    (
-                        status,
-                        Json(BuildNodeReceipt {
-                            builder_id: "builder-a".into(),
-                            round_id: 7,
-                            evidence_id: 42,
-                        }),
-                    )
-                },
-            ),
+            post(move |Json(_): Json<BuildCommand>| async move {
+                (
+                    status,
+                    Json(BuildNodeReceipt {
+                        builder_id: "builder-a".into(),
+                        round_id: 7,
+                        evidence_id: 42,
+                    }),
+                )
+            }),
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -728,7 +691,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn round_manager_enforces_auth_validates_commands_and_queues_work() {
+    async fn round_manager_validates_commands_and_queues_work() {
         let command = BuildCommand {
             package_ref: "nixpkgs#hello".into(),
             substitute: false,
@@ -749,27 +712,13 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         let node = spawn_builder_node(StatusCode::OK).await;
-        let manager = RoundManager::new(vec![node], "builder-secret".into(), 64).unwrap();
+        let manager = RoundManager::new(vec![node], 64).unwrap();
         let app = router(
             AppState::in_memory()
                 .await
                 .unwrap()
-                .with_round_manager(manager, "manager-secret".into()),
+                .with_round_manager(manager),
         );
-        let unauthorized = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/builds")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(serde_json::to_vec(&command).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
-
         let mut invalid = command.clone();
         invalid.package_ref = "invalid".into();
         let invalid = app
@@ -779,7 +728,6 @@ mod tests {
                     .method("POST")
                     .uri("/v1/builds")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .header(header::AUTHORIZATION, "Bearer manager-secret")
                     .body(Body::from(serde_json::to_vec(&invalid).unwrap()))
                     .unwrap(),
             )
@@ -793,7 +741,6 @@ mod tests {
                     .method("POST")
                     .uri("/v1/builds")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .header(header::AUTHORIZATION, "Bearer manager-secret")
                     .body(Body::from(serde_json::to_vec(&command).unwrap()))
                     .unwrap(),
             )
@@ -806,13 +753,12 @@ mod tests {
         assert!(receipt.queued);
 
         let failing_node = spawn_builder_node(StatusCode::CONFLICT).await;
-        let failing_manager =
-            RoundManager::new(vec![failing_node], "builder-secret".into(), 64).unwrap();
+        let failing_manager = RoundManager::new(vec![failing_node], 64).unwrap();
         let failing = router(
             AppState::in_memory()
                 .await
                 .unwrap()
-                .with_round_manager(failing_manager, "manager-secret".into()),
+                .with_round_manager(failing_manager),
         );
         let failed = failing
             .oneshot(
@@ -820,7 +766,6 @@ mod tests {
                     .method("POST")
                     .uri("/v1/builds")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .header(header::AUTHORIZATION, "Bearer manager-secret")
                     .body(Body::from(serde_json::to_vec(&command).unwrap()))
                     .unwrap(),
             )

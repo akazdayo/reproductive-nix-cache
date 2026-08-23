@@ -2,7 +2,7 @@ use anyhow::{Context, bail};
 use axum::{
     Json, Router,
     extract::State,
-    http::{HeaderMap, StatusCode, header},
+    http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -38,25 +38,19 @@ struct Cli {
     /// Suppress Nix build output
     #[arg(long)]
     quiet: bool,
-
-    /// Token required on build requests
-    #[arg(long, env = "NIX_CACHE_BUILDER_TOKEN", hide_env_values = true)]
-    token: String,
 }
 
 #[derive(Clone)]
 struct AppState {
-    token: Arc<str>,
     permits: Arc<Semaphore>,
     execute: BuildExecutor,
 }
 
-fn router(token: String, execute: BuildExecutor) -> Router {
+fn router(execute: BuildExecutor) -> Router {
     Router::new()
         .route("/", get(health))
         .route("/v1/builds", post(run_build))
         .with_state(AppState {
-            token: token.into(),
             permits: Arc::new(Semaphore::new(1)),
             execute,
         })
@@ -66,14 +60,7 @@ async fn health() -> &'static str {
     "ok"
 }
 
-async fn run_build(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(command): Json<BuildCommand>,
-) -> Response {
-    if !authorized(&headers, &state.token) {
-        return error(StatusCode::UNAUTHORIZED, "invalid bearer token");
-    }
+async fn run_build(State(state): State<AppState>, Json(command): Json<BuildCommand>) -> Response {
     if let Err(message) = command.validate() {
         return error(StatusCode::BAD_REQUEST, message);
     }
@@ -88,14 +75,6 @@ async fn run_build(
         Ok(receipt) => (StatusCode::OK, Json(receipt)).into_response(),
         Err(message) => error(StatusCode::INTERNAL_SERVER_ERROR, message),
     }
-}
-
-fn authorized(headers: &HeaderMap, expected: &str) -> bool {
-    headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|token| !expected.is_empty() && token == expected)
 }
 
 fn error(status: StatusCode, message: impl Into<String>) -> Response {
@@ -119,10 +98,6 @@ async fn main() -> anyhow::Result<()> {
     if cli.builder_id.trim().is_empty() {
         bail!("--builder-id must not be empty");
     }
-    if cli.token.is_empty() {
-        bail!("NIX_CACHE_BUILDER_TOKEN must not be empty");
-    }
-
     let config = Arc::new(BuilderConfig {
         builder_id: cli.builder_id,
         server: cli.server,
@@ -143,7 +118,7 @@ async fn main() -> anyhow::Result<()> {
             })
         })
     });
-    let app = router(cli.token, execute);
+    let app = router(execute);
     let listener = TcpListener::bind(cli.listen)
         .await
         .with_context(|| format!("failed to listen on {}", cli.listen))?;
@@ -160,19 +135,16 @@ mod tests {
     use super::*;
     use axum::{
         body::{Body, to_bytes},
-        http::Request,
+        http::{Request, header},
     };
     use std::sync::Mutex;
     use tower::ServiceExt;
 
-    fn request(command: &BuildCommand, token: Option<&str>) -> Request<Body> {
-        let mut request = Request::builder()
+    fn request(command: &BuildCommand) -> Request<Body> {
+        let request = Request::builder()
             .method("POST")
             .uri("/v1/builds")
             .header(header::CONTENT_TYPE, "application/json");
-        if let Some(token) = token {
-            request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
-        }
         request
             .body(Body::from(serde_json::to_vec(command).unwrap()))
             .unwrap()
@@ -187,27 +159,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_unauthorized_and_invalid_commands_before_execution() {
+    async fn rejects_invalid_commands_before_execution() {
         let execute: BuildExecutor = Arc::new(|_| panic!("must not execute"));
-        let app = router("secret".into(), execute);
-        assert_eq!(
-            app.clone()
-                .oneshot(request(&command(), None))
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::UNAUTHORIZED
-        );
+        let app = router(execute);
 
         let invalid = BuildCommand {
             package_ref: "invalid".into(),
             ..command()
         };
         assert_eq!(
-            app.oneshot(request(&invalid, Some("secret")))
-                .await
-                .unwrap()
-                .status(),
+            app.oneshot(request(&invalid)).await.unwrap().status(),
             StatusCode::BAD_REQUEST
         );
     }
@@ -226,12 +187,9 @@ mod tests {
                 })
             })
         });
-        let app = router("secret".into(), execute);
+        let app = router(execute);
         let command = command();
-        let response = app
-            .oneshot(request(&command, Some("secret")))
-            .await
-            .unwrap();
+        let response = app.oneshot(request(&command)).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let receipt: BuildNodeReceipt =
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
@@ -252,20 +210,13 @@ mod tests {
                 })
             })
         });
-        let app = router("secret".into(), execute);
+        let app = router(execute);
         let first_app = app.clone();
-        let first = tokio::spawn(async move {
-            first_app
-                .oneshot(request(&command(), Some("secret")))
-                .await
-                .unwrap()
-        });
+        let first =
+            tokio::spawn(async move { first_app.oneshot(request(&command())).await.unwrap() });
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-        let second = app
-            .oneshot(request(&command(), Some("secret")))
-            .await
-            .unwrap();
+        let second = app.oneshot(request(&command())).await.unwrap();
         assert_eq!(second.status(), StatusCode::CONFLICT);
         assert_eq!(first.await.unwrap().status(), StatusCode::OK);
     }
