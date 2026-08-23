@@ -5,6 +5,7 @@ mod cli;
 mod config;
 mod entity;
 mod metrics;
+mod overview;
 mod round_manager;
 mod store;
 use anyhow::bail;

@@ -1,6 +1,7 @@
 use crate::{
     binary_cache::{BinaryCache, CACHE_INFO},
     metrics::{self, ExportContext, HttpMetrics, ServerMetadata},
+    overview,
     round_manager::RoundManager,
     store::{EvidenceStore, ProtocolError, RoundConfig},
 };
@@ -10,7 +11,7 @@ use axum::{
     extract::{DefaultBodyLimit, MatchedPath, Path, Query, Request, State},
     http::{StatusCode, header},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
@@ -74,8 +75,10 @@ impl AppState {
 pub fn router(state: AppState) -> Router {
     let http_metrics = state.http_metrics.clone();
     Router::new()
-        .route("/", get(health))
+        .route("/", get(overview_page))
+        .route("/healthz", get(health))
         .route("/metrics", get(prometheus_metrics))
+        .route("/v1/overview", get(overview_data))
         .route("/v1/evidence", get(list_evidence))
         .route("/v1/builds", post(dispatch_build))
         .route("/v1/evidence/commitments", post(commit_evidence))
@@ -102,6 +105,19 @@ pub fn router(state: AppState) -> Router {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+async fn overview_page() -> Html<&'static str> {
+    Html(overview::INDEX_HTML)
+}
+
+async fn overview_data(
+    State(state): State<AppState>,
+) -> ApiResult<Json<overview::OverviewResponse>> {
+    overview::load(&state.store, state.round_config)
+        .await
+        .map(Json)
+        .map_err(ApiError::internal)
 }
 
 async fn prometheus_metrics(State(state): State<AppState>) -> ApiResult<Response> {
@@ -905,6 +921,152 @@ mod tests {
                 .unwrap();
         assert_eq!(round_facts.evidences.len(), 1);
         assert_eq!(round_facts.evidences[0].round_id, Some(round_id));
+    }
+
+    #[tokio::test]
+    async fn overview_page_and_health_endpoint_are_available() {
+        let app = router(AppState::in_memory().await.unwrap());
+        let page = app
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(page.status(), StatusCode::OK);
+        assert_eq!(
+            page.headers()[header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
+        let body = String::from_utf8(
+            to_bytes(page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("Consensus Graph"));
+        assert!(body.contains("/v1/overview"));
+
+        let health = app
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(health.into_body(), usize::MAX).await.unwrap(),
+            "ok"
+        );
+    }
+
+    #[tokio::test]
+    async fn overview_reports_reveal_states_and_hashes_without_commit_secrets() {
+        let app = router(
+            AppState::in_memory()
+                .await
+                .unwrap()
+                .with_round_config(test_round_config(2)),
+        );
+        let first = evidence("builder-a", "sha256-result");
+        let (round_id, first_nonce) = commit_via_api(&app, &first).await;
+
+        let waiting = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/overview")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(waiting.status(), StatusCode::OK);
+        let waiting_body = to_bytes(waiting.into_body(), usize::MAX).await.unwrap();
+        let waiting_json: serde_json::Value = serde_json::from_slice(&waiting_body).unwrap();
+        let participant = &waiting_json["rounds"][0]["participants"][0];
+        assert_eq!(participant["reveal_status"], "waiting");
+        assert_eq!(participant["outputs"], serde_json::json!([]));
+        let waiting_text = String::from_utf8(waiting_body.to_vec()).unwrap();
+        assert!(!waiting_text.contains("digest"));
+        assert!(!waiting_text.contains("nonce"));
+
+        let second = evidence("builder-b", "sha256-result");
+        let (second_round_id, second_nonce) = commit_via_api(&app, &second).await;
+        assert_eq!(second_round_id, round_id);
+        assert_eq!(
+            reveal_via_api(&app, round_id, &first_nonce, &first)
+                .await
+                .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            reveal_via_api(&app, round_id, &second_nonce, &second)
+                .await
+                .status(),
+            StatusCode::CREATED
+        );
+
+        let completed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/overview")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let completed_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(completed.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(completed_json["rounds"][0]["phase"], "completed");
+        assert_eq!(completed_json["rounds"][0]["reveal_count"], 2);
+        for participant in completed_json["rounds"][0]["participants"]
+            .as_array()
+            .unwrap()
+        {
+            assert_eq!(participant["reveal_status"], "success");
+            assert_eq!(participant["outputs"][0]["nar_hash"], "sha256-result");
+        }
+    }
+
+    #[tokio::test]
+    async fn overview_marks_missing_reveals_as_failed_after_expiration() {
+        let config = RoundConfig {
+            minimum_builders: 2,
+            commit_window: Duration::seconds(60),
+            reveal_window: Duration::milliseconds(5),
+        };
+        let app = router(
+            AppState::in_memory()
+                .await
+                .unwrap()
+                .with_round_config(config),
+        );
+        let first = evidence("builder-a", "sha256-result");
+        let second = evidence("builder-b", "sha256-result");
+        commit_via_api(&app, &first).await;
+        commit_via_api(&app, &second).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/overview")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["rounds"][0]["phase"], "expired");
+        for participant in body["rounds"][0]["participants"].as_array().unwrap() {
+            assert_eq!(participant["reveal_status"], "failed");
+        }
     }
 
     #[tokio::test]

@@ -1,0 +1,600 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Consensus Graph · Reproductive Nix Cache</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #111216;
+      --panel: rgba(25, 27, 33, .92);
+      --panel-soft: rgba(31, 34, 41, .72);
+      --line: #333741;
+      --line-soft: rgba(126, 133, 151, .18);
+      --text: #e8e9ed;
+      --muted: #9298a8;
+      --faint: #666d7c;
+      --accent: #a987ff;
+      --success: #57d68d;
+      --failed: #ff657a;
+      --waiting: #8d93a1;
+      --shadow: 0 20px 60px rgba(0, 0, 0, .28);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { width: 100%; min-height: 100%; margin: 0; background: var(--bg); color: var(--text); }
+    body {
+      background:
+        radial-gradient(circle at 55% 35%, rgba(111, 77, 185, .09), transparent 32rem),
+        radial-gradient(circle at 90% 5%, rgba(50, 151, 127, .05), transparent 28rem),
+        var(--bg);
+      overflow: hidden;
+    }
+
+    button { font: inherit; }
+
+    .shell { height: 100vh; min-height: 620px; display: grid; grid-template-rows: auto 1fr; }
+
+    header {
+      min-height: 72px;
+      padding: 14px 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(17, 18, 22, .82);
+      backdrop-filter: blur(18px);
+      z-index: 3;
+    }
+
+    .brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
+    .brand-mark {
+      width: 34px;
+      height: 34px;
+      position: relative;
+      flex: 0 0 auto;
+    }
+    .brand-mark span { position: absolute; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 18px rgba(169, 135, 255, .55); }
+    .brand-mark span:nth-child(1) { left: 2px; top: 13px; }
+    .brand-mark span:nth-child(2) { right: 2px; top: 3px; }
+    .brand-mark span:nth-child(3) { right: 3px; bottom: 2px; }
+    .brand-mark::before, .brand-mark::after { content: ""; position: absolute; height: 1px; background: rgba(169, 135, 255, .7); transform-origin: left center; left: 8px; top: 16px; }
+    .brand-mark::before { width: 22px; transform: rotate(-34deg); }
+    .brand-mark::after { width: 22px; transform: rotate(33deg); }
+    h1 { margin: 0; font-size: 15px; letter-spacing: .01em; font-weight: 620; white-space: nowrap; }
+    .eyebrow { margin: 0 0 3px; color: var(--muted); font-size: 10px; font-weight: 650; letter-spacing: .15em; text-transform: uppercase; }
+
+    .header-stats { display: flex; align-items: center; gap: 22px; }
+    .stat { display: grid; gap: 2px; text-align: right; }
+    .stat strong { font-size: 14px; font-variant-numeric: tabular-nums; }
+    .stat span { color: var(--muted); font-size: 10px; letter-spacing: .07em; text-transform: uppercase; }
+    .live { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 11px; }
+    .live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--success); box-shadow: 0 0 10px rgba(87, 214, 141, .65); }
+    .live.offline .live-dot { background: var(--failed); box-shadow: none; }
+
+    .workspace { min-height: 0; display: grid; grid-template-columns: 244px minmax(360px, 1fr) 340px; }
+    aside { min-width: 0; min-height: 0; background: var(--panel); }
+    .rounds-panel { border-right: 1px solid var(--line); display: flex; flex-direction: column; }
+    .detail-panel { border-left: 1px solid var(--line); overflow: auto; }
+    .panel-head { padding: 19px 16px 12px; display: flex; align-items: center; justify-content: space-between; }
+    .panel-head h2, .detail-section h2 { margin: 0; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .13em; font-weight: 680; }
+    .count { color: var(--faint); font-size: 11px; font-variant-numeric: tabular-nums; }
+
+    #rounds { overflow-x: hidden; overflow-y: auto; padding: 0 9px 18px; }
+    .round-item {
+      width: 100%;
+      border: 1px solid transparent;
+      background: transparent;
+      color: inherit;
+      padding: 10px 10px 11px;
+      border-radius: 8px;
+      text-align: left;
+      cursor: pointer;
+      display: grid;
+      gap: 8px;
+      transition: background .15s ease, border-color .15s ease;
+    }
+    .round-item:hover { background: rgba(255, 255, 255, .035); }
+    .round-item.active { background: rgba(169, 135, 255, .08); border-color: rgba(169, 135, 255, .2); }
+    .round-title { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .round-title strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 580; }
+    .round-meta { min-width: 0; display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 10px; }
+    .round-meta > span:nth-child(2) { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .round-progress { margin-left: auto; font-variant-numeric: tabular-nums; }
+    .phase-pill { flex: 0 0 auto; padding: 3px 6px; border-radius: 999px; font-size: 8px; font-weight: 750; letter-spacing: .08em; text-transform: uppercase; border: 1px solid var(--line); color: var(--muted); }
+    .phase-pill.completed { border-color: rgba(87, 214, 141, .32); color: var(--success); background: rgba(87, 214, 141, .06); }
+    .phase-pill.expired { border-color: rgba(255, 101, 122, .3); color: var(--failed); background: rgba(255, 101, 122, .06); }
+    .phase-pill.revealing { border-color: rgba(169, 135, 255, .34); color: #b99eff; background: rgba(169, 135, 255, .07); }
+
+    main { min-width: 0; min-height: 0; position: relative; overflow: hidden; }
+    #graph { display: block; width: 100%; height: 100%; cursor: grab; touch-action: none; }
+    #graph.dragging { cursor: grabbing; }
+    .graph-topline { position: absolute; inset: 16px 18px auto; display: flex; align-items: flex-start; justify-content: space-between; pointer-events: none; }
+    .graph-title { min-width: 0; }
+    .graph-title h2 { max-width: min(58vw, 720px); margin: 0; font-size: 13px; font-weight: 560; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .graph-title p { margin: 5px 0 0; color: var(--muted); font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .graph-actions { display: flex; pointer-events: auto; }
+    .icon-button { border: 1px solid var(--line); background: rgba(26, 28, 34, .78); color: var(--muted); border-radius: 7px; padding: 6px 9px; cursor: pointer; font-size: 11px; }
+    .icon-button:hover { color: var(--text); border-color: #4a4f5c; }
+    .legend { position: absolute; left: 18px; bottom: 16px; display: flex; flex-wrap: wrap; gap: 10px 14px; padding: 8px 11px; border: 1px solid var(--line-soft); border-radius: 8px; background: rgba(18, 19, 23, .78); backdrop-filter: blur(8px); color: var(--muted); font-size: 9px; pointer-events: none; }
+    .legend-item { display: inline-flex; align-items: center; gap: 6px; }
+    .legend-dot { width: 8px; height: 8px; border-radius: 50%; background: #4b5060; border: 2px solid var(--waiting); }
+    .legend-dot.success { border-color: var(--success); }
+    .legend-dot.failed { border-color: var(--failed); }
+    .legend-dot.hash { border: 0; background: linear-gradient(135deg, #a987ff, #53d5ad); }
+    .zoom-hint { position: absolute; right: 18px; bottom: 18px; color: var(--faint); font-size: 9px; pointer-events: none; }
+
+    #tooltip { position: fixed; z-index: 10; pointer-events: none; opacity: 0; transform: translate(10px, 10px); padding: 7px 9px; background: #242730; border: 1px solid #454a58; box-shadow: var(--shadow); border-radius: 6px; font-size: 10px; max-width: 280px; transition: opacity .08s ease; }
+    #tooltip.visible { opacity: 1; }
+    #tooltip strong { display: block; margin-bottom: 3px; font-size: 10px; }
+    #tooltip span { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
+
+    .detail-section { padding: 18px 17px; border-bottom: 1px solid var(--line); }
+    .outcome { margin-top: 13px; display: flex; align-items: center; gap: 10px; }
+    .outcome-mark { width: 31px; height: 31px; display: grid; place-items: center; border: 1px solid rgba(169, 135, 255, .28); border-radius: 50%; background: rgba(169, 135, 255, .07); color: var(--accent); }
+    .outcome strong { display: block; font-size: 13px; font-weight: 620; }
+    .outcome span { display: block; margin-top: 2px; color: var(--muted); font-size: 10px; }
+    .meter { height: 3px; margin-top: 14px; border-radius: 99px; background: #292c34; overflow: hidden; }
+    .meter span { display: block; height: 100%; border-radius: inherit; background: var(--accent); transition: width .25s ease; }
+    .detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 12px; margin-top: 15px; }
+    .detail-value { min-width: 0; }
+    .detail-value span { display: block; margin-bottom: 4px; color: var(--faint); font-size: 9px; letter-spacing: .07em; text-transform: uppercase; }
+    .detail-value strong { display: block; font-size: 11px; font-weight: 520; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+
+    #results { margin-top: 12px; display: grid; gap: 8px; }
+    .result-card { position: relative; padding: 11px 11px 10px 15px; border: 1px solid var(--line-soft); border-radius: 8px; background: var(--panel-soft); overflow: hidden; }
+    .result-card::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--hash-color, var(--faint)); }
+    .result-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .result-head code { color: var(--text); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .votes { flex: 0 0 auto; color: var(--muted); font-size: 9px; }
+    .builders { margin: 7px 0 0; color: var(--muted); font-size: 10px; line-height: 1.5; overflow-wrap: anywhere; }
+    .output { margin-top: 9px; padding-top: 8px; border-top: 1px solid var(--line-soft); }
+    .output-name { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 9px; }
+    .output-name span { color: var(--muted); }
+    .output code { display: block; margin-top: 4px; color: var(--faint); font-size: 8px; line-height: 1.45; overflow-wrap: anywhere; word-break: break-all; }
+    .empty { padding: 28px 18px; color: var(--muted); font-size: 11px; line-height: 1.6; text-align: center; }
+    .error-banner { display: none; position: absolute; top: 58px; left: 50%; transform: translateX(-50%); z-index: 4; border: 1px solid rgba(255, 101, 122, .35); background: rgba(53, 27, 34, .92); color: #ffb1bd; border-radius: 7px; padding: 8px 12px; font-size: 10px; box-shadow: var(--shadow); }
+    .error-banner.visible { display: block; }
+
+    @media (max-width: 980px) {
+      .workspace { grid-template-columns: 210px 1fr; }
+      .detail-panel { display: none; }
+    }
+    @media (max-width: 660px) {
+      body { overflow-x: hidden; overflow-y: auto; }
+      .shell { width: 100vw; max-width: 100vw; height: auto; min-height: 100vh; overflow-x: hidden; }
+      header { width: 100%; min-width: 0; align-items: flex-start; }
+      .header-stats .stat { display: none; }
+      .workspace { width: 100%; min-width: 0; max-width: 100%; display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto 68vh auto; overflow-x: hidden; }
+      .rounds-panel { border-right: 0; border-bottom: 1px solid var(--line); max-height: 190px; }
+      .detail-panel { display: block; border-left: 0; border-top: 1px solid var(--line); }
+      #rounds { display: flex; overflow-x: auto; padding-bottom: 10px; }
+      .round-item { flex: 0 0 205px; }
+      .graph-title h2 { max-width: 70vw; }
+      .zoom-hint { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header>
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+        <div>
+          <p class="eyebrow">Reproductive Nix Cache</p>
+          <h1>Consensus Graph</h1>
+        </div>
+      </div>
+      <div class="header-stats">
+        <div class="stat"><strong id="round-total">—</strong><span>Rounds</span></div>
+        <div class="stat"><strong id="builder-total">—</strong><span>Builders</span></div>
+        <div class="live" id="live"><span class="live-dot"></span><span id="live-label">Connecting</span></div>
+      </div>
+    </header>
+
+    <div class="workspace">
+      <aside class="rounds-panel">
+        <div class="panel-head"><h2>Recent rounds</h2><span class="count" id="round-count"></span></div>
+        <div id="rounds"><div class="empty">Loading rounds…</div></div>
+      </aside>
+
+      <main>
+        <canvas id="graph" aria-label="Commit-reveal consensus graph"></canvas>
+        <div class="graph-topline">
+          <div class="graph-title"><h2 id="graph-heading">No round selected</h2><p id="graph-subtitle">—</p></div>
+          <div class="graph-actions"><button class="icon-button" id="reset-view" type="button">Reset view</button></div>
+        </div>
+        <div class="legend" aria-label="Graph legend">
+          <span class="legend-item"><i class="legend-dot"></i> waiting</span>
+          <span class="legend-item"><i class="legend-dot failed"></i> failed</span>
+          <span class="legend-item"><i class="legend-dot success"></i> success</span>
+          <span class="legend-item"><i class="legend-dot hash"></i> same hash · same fill</span>
+        </div>
+        <div class="zoom-hint">scroll to zoom · drag to move</div>
+        <div class="error-banner" id="error-banner">Overview data could not be refreshed.</div>
+      </main>
+
+      <aside class="detail-panel" id="details">
+        <div class="empty">Select a round to inspect its result.</div>
+      </aside>
+    </div>
+  </div>
+  <div id="tooltip" role="status"></div>
+
+  <script>
+    (() => {
+      "use strict";
+
+      const STATUS_COLORS = { waiting: "#8d93a1", failed: "#ff657a", success: "#57d68d" };
+      const state = {
+        data: { rounds: [] }, selectedRoundId: null, selectedNodeId: null,
+        nodes: [], edges: [], transform: { x: 0, y: 0, scale: 1 },
+        width: 0, height: 0, ticks: 0, frame: 0, dragging: null, pointer: null
+      };
+      const canvas = document.querySelector("#graph");
+      const ctx = canvas.getContext("2d");
+      const tooltip = document.querySelector("#tooltip");
+
+      const escapeHtml = value => String(value ?? "").replace(/[&<>'"]/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[char]);
+      const phaseLabel = phase => ({ committing: "Committing", revealing: "Revealing", completed: "Completed", expired: "Expired" })[phase] || phase;
+      const fileName = path => path ? path.split("/").pop().replace(/\.drv$/, "") : "unknown derivation";
+      const shortHash = hash => hash && hash.length > 19 ? `${hash.slice(0, 11)}…${hash.slice(-6)}` : (hash || "waiting");
+      const formatTime = value => value ? new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(new Date(value)) : "—";
+      const formatBytes = bytes => {
+        if (!Number.isFinite(bytes)) return "—";
+        const units = ["B", "KiB", "MiB", "GiB"];
+        let value = bytes, unit = 0;
+        while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit += 1; }
+        return `${value.toFixed(unit ? 1 : 0)} ${units[unit]}`;
+      };
+      const resultKey = participant => participant.outputs.length
+        ? participant.outputs.map(output => output.nar_hash).sort().join("|")
+        : null;
+      const hashColor = value => {
+        let hash = 2166136261;
+        for (let index = 0; index < value.length; index += 1) {
+          hash ^= value.charCodeAt(index);
+          hash = Math.imul(hash, 16777619);
+        }
+        const hue = Math.abs(hash) % 360;
+        return `hsl(${hue} 68% 61%)`;
+      };
+
+      function selectedRound() {
+        return state.data.rounds.find(round => round.id === state.selectedRoundId) || null;
+      }
+
+      function renderChrome() {
+        const rounds = state.data.rounds;
+        const builders = new Set(rounds.flatMap(round => round.participants.map(participant => participant.builder_id)));
+        document.querySelector("#round-total").textContent = rounds.length;
+        document.querySelector("#builder-total").textContent = builders.size;
+        document.querySelector("#round-count").textContent = `${rounds.length} shown`;
+        const list = document.querySelector("#rounds");
+        if (!rounds.length) {
+          list.innerHTML = '<div class="empty">No commit-reveal rounds yet.</div>';
+          return;
+        }
+        list.innerHTML = rounds.map(round => `
+          <button type="button" class="round-item ${round.id === state.selectedRoundId ? "active" : ""}" data-round-id="${round.id}">
+            <span class="round-title"><strong>${escapeHtml(fileName(round.derivation_path))}</strong><span class="phase-pill ${round.phase}">${phaseLabel(round.phase)}</span></span>
+            <span class="round-meta"><span>#${round.id}</span><span>${formatTime(round.started_at)}</span><span class="round-progress">${round.reveal_count}/${round.commit_count}</span></span>
+          </button>`).join("");
+        list.querySelectorAll("[data-round-id]").forEach(button => button.addEventListener("click", () => selectRound(Number(button.dataset.roundId))));
+      }
+
+      function groupResults(round) {
+        const groups = new Map();
+        for (const participant of round.participants) {
+          const key = resultKey(participant);
+          if (!key) continue;
+          if (!groups.has(key)) groups.set(key, { key, color: hashColor(key), participants: [], outputs: participant.outputs });
+          groups.get(key).participants.push(participant);
+        }
+        return [...groups.values()].sort((left, right) => right.participants.length - left.participants.length || left.key.localeCompare(right.key));
+      }
+
+      function outcomeFor(round, groups) {
+        if (round.phase === "committing") return ["Collecting commitments", "Results remain hidden until reveal"];
+        if (round.phase === "revealing") return ["Reveal in progress", `${round.reveal_count} of ${round.commit_count} builders revealed`];
+        if (round.phase === "expired") return ["Round expired", `${round.commit_count - round.reveal_count} reveal${round.commit_count - round.reveal_count === 1 ? "" : "s"} missing`];
+        if (groups.length === 1) return ["Results match", `${groups[0].participants.length} builders reported the same output`];
+        return ["Results diverge", `${groups.length} distinct output variants detected`];
+      }
+
+      function renderDetails() {
+        const round = selectedRound();
+        const panel = document.querySelector("#details");
+        if (!round) { panel.innerHTML = '<div class="empty">Select a round to inspect its result.</div>'; return; }
+        const groups = groupResults(round);
+        const [outcome, outcomeDetail] = outcomeFor(round, groups);
+        const outcomeMark = round.phase === "expired" ? "!" : round.phase === "committing" ? "○" : round.phase === "revealing" ? "…" : groups.length > 1 ? "≠" : "✓";
+        const progress = round.commit_count ? Math.round(round.reveal_count / round.commit_count * 100) : 0;
+        const failed = round.participants.filter(participant => participant.reveal_status === "failed").length;
+        const resultCards = groups.length ? groups.map(group => `
+          <article class="result-card" style="--hash-color:${group.color}">
+            <div class="result-head"><code>${escapeHtml(shortHash(group.outputs[0]?.nar_hash))}</code><span class="votes">${group.participants.length} builder${group.participants.length === 1 ? "" : "s"}</span></div>
+            <p class="builders">${group.participants.map(participant => escapeHtml(participant.builder_id)).join(" · ")}</p>
+            ${group.outputs.map(output => `<div class="output"><div class="output-name"><strong>${escapeHtml(output.name)}</strong><span>${formatBytes(output.nar_size)}</span></div><code>${escapeHtml(output.store_path)}<br>${escapeHtml(output.nar_hash)}</code></div>`).join("")}
+          </article>`).join("") : '<div class="empty">Result hashes appear after a successful reveal.</div>';
+        panel.innerHTML = `
+          <section class="detail-section">
+            <h2>Round outcome</h2>
+            <div class="outcome"><div class="outcome-mark">${outcomeMark}</div><div><strong>${escapeHtml(outcome)}</strong><span>${escapeHtml(outcomeDetail)}</span></div></div>
+            <div class="meter"><span style="width:${progress}%"></span></div>
+            <div class="detail-grid">
+              <div class="detail-value"><span>Phase</span><strong>${phaseLabel(round.phase)}</strong></div>
+              <div class="detail-value"><span>Round</span><strong>#${round.id}</strong></div>
+              <div class="detail-value"><span>Reveals</span><strong>${round.reveal_count} / ${round.commit_count}</strong></div>
+              <div class="detail-value"><span>Failed</span><strong>${failed}</strong></div>
+              <div class="detail-value"><span>Started</span><strong title="${escapeHtml(round.started_at)}">${formatTime(round.started_at)}</strong></div>
+              <div class="detail-value"><span>Closed</span><strong title="${escapeHtml(round.closed_at || "")}">${formatTime(round.closed_at)}</strong></div>
+            </div>
+          </section>
+          <section class="detail-section"><h2>Result variants</h2><div id="results">${resultCards}</div></section>`;
+      }
+
+      function selectRound(roundId) {
+        state.selectedRoundId = roundId;
+        state.selectedNodeId = null;
+        renderChrome();
+        renderDetails();
+        buildGraph();
+      }
+
+      function buildGraph() {
+        const round = selectedRound();
+        state.nodes = [];
+        state.edges = [];
+        state.transform = { x: 0, y: 0, scale: 1 };
+        state.ticks = 0;
+        if (!round) {
+          document.querySelector("#graph-heading").textContent = "No round selected";
+          document.querySelector("#graph-subtitle").textContent = "—";
+          draw();
+          return;
+        }
+        document.querySelector("#graph-heading").textContent = fileName(round.derivation_path);
+        document.querySelector("#graph-subtitle").textContent = `${round.derivation_path}  ·  round #${round.id}`;
+        const groups = groupResults(round);
+        const groupByKey = new Map(groups.map(group => [group.key, group]));
+        const roundNode = { id: `round:${round.id}`, type: "round", label: `round #${round.id}`, detail: phaseLabel(round.phase), x: 0, y: 0, vx: 0, vy: 0, degree: round.participants.length, fixed: true };
+        state.nodes.push(roundNode);
+
+        groups.forEach((group, index) => {
+          const angle = Math.PI * 2 * index / Math.max(groups.length, 1) - Math.PI / 2;
+          const radius = groups.length === 1 ? 225 : 250;
+          state.nodes.push({ id: `result:${group.key}`, type: "result", label: shortHash(group.outputs[0]?.nar_hash), detail: `${group.participants.length} matching builder${group.participants.length === 1 ? "" : "s"}`, key: group.key, color: group.color, x: Math.cos(angle) * radius, y: Math.sin(angle) * radius, vx: 0, vy: 0, degree: group.participants.length });
+        });
+
+        round.participants.forEach((participant, index) => {
+          const angle = Math.PI * 2 * index / Math.max(round.participants.length, 1) - Math.PI / 2;
+          const key = resultKey(participant);
+          const color = key ? groupByKey.get(key).color : (participant.reveal_status === "failed" ? "#593039" : "#3e424c");
+          const node = { id: `builder:${index}`, type: "builder", label: participant.builder_id, detail: participant.reveal_status, participant, key, color, status: participant.reveal_status, x: Math.cos(angle) * 145 + (index % 2 ? 8 : -8), y: Math.sin(angle) * 145, vx: 0, vy: 0, degree: key ? 2 : 1 };
+          state.nodes.push(node);
+          state.edges.push({ source: roundNode.id, target: node.id, color: STATUS_COLORS[participant.reveal_status], type: "status" });
+          if (key) state.edges.push({ source: node.id, target: `result:${key}`, color, type: "result" });
+        });
+        schedule();
+      }
+
+      function nodeRadius(node) {
+        const base = node.type === "round" ? 10 : node.type === "result" ? 8 : 6;
+        return base + Math.sqrt(Math.max(node.degree, 1)) * (node.type === "builder" ? 1.7 : 2.5);
+      }
+
+      function simulate() {
+        const nodes = state.nodes;
+        const byId = new Map(nodes.map(node => [node.id, node]));
+        for (let leftIndex = 0; leftIndex < nodes.length; leftIndex += 1) {
+          for (let rightIndex = leftIndex + 1; rightIndex < nodes.length; rightIndex += 1) {
+            const left = nodes[leftIndex], right = nodes[rightIndex];
+            let dx = right.x - left.x, dy = right.y - left.y;
+            let distanceSquared = dx * dx + dy * dy;
+            if (distanceSquared < .01) { dx = .1; dy = .1; distanceSquared = .02; }
+            const distance = Math.sqrt(distanceSquared);
+            const force = Math.min(1.2, 920 / distanceSquared);
+            const fx = dx / distance * force, fy = dy / distance * force;
+            if (!left.fixed) { left.vx -= fx; left.vy -= fy; }
+            if (!right.fixed) { right.vx += fx; right.vy += fy; }
+          }
+        }
+        for (const edge of state.edges) {
+          const source = byId.get(edge.source), target = byId.get(edge.target);
+          const dx = target.x - source.x, dy = target.y - source.y;
+          const distance = Math.max(Math.sqrt(dx * dx + dy * dy), 1);
+          const ideal = edge.type === "result" ? 92 : 145;
+          const force = (distance - ideal) * .0045;
+          const fx = dx / distance * force, fy = dy / distance * force;
+          if (!source.fixed) { source.vx += fx; source.vy += fy; }
+          if (!target.fixed) { target.vx -= fx; target.vy -= fy; }
+        }
+        for (const node of nodes) {
+          if (node.fixed || state.dragging?.node === node) continue;
+          node.vx += -node.x * .0006;
+          node.vy += -node.y * .0006;
+          node.vx *= .9; node.vy *= .9;
+          node.x += node.vx; node.y += node.vy;
+        }
+        state.ticks += 1;
+      }
+
+      function schedule() {
+        cancelAnimationFrame(state.frame);
+        const animate = () => {
+          if (state.ticks < 280 || state.dragging) simulate();
+          draw();
+          if (state.ticks < 280 || state.dragging) state.frame = requestAnimationFrame(animate);
+        };
+        state.frame = requestAnimationFrame(animate);
+      }
+
+      function drawGrid() {
+        const spacing = 34 * state.transform.scale;
+        if (spacing < 11) return;
+        const originX = state.width / 2 + state.transform.x;
+        const originY = state.height / 2 + state.transform.y;
+        ctx.fillStyle = "rgba(130, 136, 151, .11)";
+        const startX = ((originX % spacing) + spacing) % spacing;
+        const startY = ((originY % spacing) + spacing) % spacing;
+        for (let x = startX; x < state.width; x += spacing) {
+          for (let y = startY; y < state.height; y += spacing) {
+            ctx.fillRect(x, y, 1, 1);
+          }
+        }
+      }
+
+      function graphToScreen(node) {
+        return { x: state.width / 2 + state.transform.x + node.x * state.transform.scale, y: state.height / 2 + state.transform.y + node.y * state.transform.scale };
+      }
+
+      function screenToGraph(x, y) {
+        return { x: (x - state.width / 2 - state.transform.x) / state.transform.scale, y: (y - state.height / 2 - state.transform.y) / state.transform.scale };
+      }
+
+      function draw() {
+        ctx.clearRect(0, 0, state.width, state.height);
+        drawGrid();
+        const byId = new Map(state.nodes.map(node => [node.id, node]));
+        ctx.lineCap = "round";
+        for (const edge of state.edges) {
+          const source = graphToScreen(byId.get(edge.source)), target = graphToScreen(byId.get(edge.target));
+          ctx.beginPath(); ctx.moveTo(source.x, source.y); ctx.lineTo(target.x, target.y);
+          ctx.strokeStyle = edge.type === "result" ? edge.color.replace("hsl", "hsla").replace(")", " / .34)") : `${edge.color}45`;
+          ctx.lineWidth = (edge.type === "result" ? 1.2 : .8) * Math.max(.7, state.transform.scale);
+          ctx.stroke();
+        }
+        for (const node of state.nodes) drawNode(node);
+      }
+
+      function drawNode(node) {
+        const point = graphToScreen(node);
+        const radius = nodeRadius(node) * state.transform.scale;
+        ctx.save();
+        if (node.type === "round") {
+          ctx.shadowColor = "rgba(169, 135, 255, .55)"; ctx.shadowBlur = 18;
+          ctx.fillStyle = "#a987ff";
+        } else {
+          ctx.shadowColor = node.color || "transparent"; ctx.shadowBlur = node.type === "result" ? 14 : 7;
+          ctx.fillStyle = node.color;
+        }
+        ctx.beginPath(); ctx.arc(point.x, point.y, radius, 0, Math.PI * 2); ctx.fill();
+        ctx.shadowBlur = 0;
+        if (node.type === "builder") {
+          ctx.strokeStyle = STATUS_COLORS[node.status]; ctx.lineWidth = Math.max(2, 2.4 * state.transform.scale);
+          ctx.beginPath(); ctx.arc(point.x, point.y, radius + 3 * state.transform.scale, 0, Math.PI * 2); ctx.stroke();
+        } else if (node.type === "result") {
+          ctx.strokeStyle = "rgba(255,255,255,.4)"; ctx.lineWidth = .8;
+          ctx.beginPath(); ctx.arc(point.x, point.y, radius + 1, 0, Math.PI * 2); ctx.stroke();
+        }
+        if (state.selectedNodeId === node.id) {
+          ctx.strokeStyle = "rgba(255,255,255,.9)"; ctx.lineWidth = 1;
+          ctx.beginPath(); ctx.arc(point.x, point.y, radius + 7, 0, Math.PI * 2); ctx.stroke();
+        }
+        const showLabel = state.transform.scale > .63 || node.type === "round";
+        if (showLabel) {
+          ctx.font = `${node.type === "round" ? 600 : 500} ${Math.max(9, 10 * Math.min(state.transform.scale, 1.15))}px Inter, system-ui, sans-serif`;
+          ctx.textAlign = "center"; ctx.textBaseline = "top"; ctx.fillStyle = node.type === "round" ? "#ece8ff" : "#b9bdc8";
+          ctx.fillText(node.label, point.x, point.y + radius + 8, 160);
+        }
+        ctx.restore();
+      }
+
+      function hitTest(clientX, clientY) {
+        const rect = canvas.getBoundingClientRect();
+        const x = clientX - rect.left, y = clientY - rect.top;
+        return [...state.nodes].reverse().find(node => {
+          const point = graphToScreen(node), radius = nodeRadius(node) * state.transform.scale + 7;
+          return (point.x - x) ** 2 + (point.y - y) ** 2 <= radius ** 2;
+        }) || null;
+      }
+
+      function showTooltip(event, node) {
+        if (!node) { tooltip.classList.remove("visible"); return; }
+        const detail = node.type === "builder" && node.key ? `${node.status} · ${shortHash(node.participant.outputs[0]?.nar_hash)}` : node.detail;
+        tooltip.innerHTML = `<strong>${escapeHtml(node.label)}</strong><span>${escapeHtml(detail)}</span>`;
+        tooltip.style.left = `${event.clientX}px`; tooltip.style.top = `${event.clientY}px`;
+        tooltip.classList.add("visible");
+      }
+
+      canvas.addEventListener("pointerdown", event => {
+        canvas.setPointerCapture(event.pointerId);
+        const node = hitTest(event.clientX, event.clientY);
+        state.pointer = { x: event.clientX, y: event.clientY };
+        state.dragging = node && !node.fixed ? { node } : { pan: true };
+        if (node) state.selectedNodeId = node.id;
+        canvas.classList.add("dragging");
+        schedule();
+      });
+      canvas.addEventListener("pointermove", event => {
+        if (!state.dragging) { showTooltip(event, hitTest(event.clientX, event.clientY)); return; }
+        const dx = event.clientX - state.pointer.x, dy = event.clientY - state.pointer.y;
+        state.pointer = { x: event.clientX, y: event.clientY };
+        if (state.dragging.node) {
+          const graph = screenToGraph(event.clientX - canvas.getBoundingClientRect().left, event.clientY - canvas.getBoundingClientRect().top);
+          state.dragging.node.x = graph.x; state.dragging.node.y = graph.y;
+          state.dragging.node.vx = 0; state.dragging.node.vy = 0;
+        } else { state.transform.x += dx; state.transform.y += dy; }
+        state.ticks = Math.min(state.ticks, 250);
+        draw();
+      });
+      const endPointer = event => {
+        if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+        state.dragging = null; state.pointer = null; canvas.classList.remove("dragging"); schedule();
+      };
+      canvas.addEventListener("pointerup", endPointer);
+      canvas.addEventListener("pointercancel", endPointer);
+      canvas.addEventListener("pointerleave", () => { if (!state.dragging) tooltip.classList.remove("visible"); });
+      canvas.addEventListener("wheel", event => {
+        event.preventDefault();
+        const rect = canvas.getBoundingClientRect();
+        const before = screenToGraph(event.clientX - rect.left, event.clientY - rect.top);
+        state.transform.scale = Math.max(.35, Math.min(2.5, state.transform.scale * Math.exp(-event.deltaY * .001)));
+        const after = screenToGraph(event.clientX - rect.left, event.clientY - rect.top);
+        state.transform.x += (after.x - before.x) * state.transform.scale;
+        state.transform.y += (after.y - before.y) * state.transform.scale;
+        draw();
+      }, { passive: false });
+      document.querySelector("#reset-view").addEventListener("click", () => { state.transform = { x: 0, y: 0, scale: 1 }; draw(); });
+
+      function resize() {
+        const rect = canvas.getBoundingClientRect();
+        const ratio = Math.min(window.devicePixelRatio || 1, 2);
+        state.width = rect.width; state.height = rect.height;
+        canvas.width = Math.round(rect.width * ratio); canvas.height = Math.round(rect.height * ratio);
+        ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+        draw();
+      }
+      new ResizeObserver(resize).observe(canvas);
+
+      async function refresh() {
+        try {
+          const response = await fetch("/v1/overview", { headers: { Accept: "application/json" }, cache: "no-store" });
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          const data = await response.json();
+          const previous = selectedRound();
+          state.data = data;
+          if (!data.rounds.some(round => round.id === state.selectedRoundId)) state.selectedRoundId = data.rounds[0]?.id ?? null;
+          const current = selectedRound();
+          renderChrome(); renderDetails();
+          if (!previous || !current || previous.id !== current.id || JSON.stringify(previous) !== JSON.stringify(current)) buildGraph();
+          document.querySelector("#live").classList.remove("offline");
+          document.querySelector("#live-label").textContent = "Live";
+          document.querySelector("#error-banner").classList.remove("visible");
+        } catch (error) {
+          console.error(error);
+          document.querySelector("#live").classList.add("offline");
+          document.querySelector("#live-label").textContent = "Offline";
+          document.querySelector("#error-banner").classList.add("visible");
+        }
+      }
+      refresh();
+      window.setInterval(refresh, 4000);
+    })();
+  </script>
+</body>
+</html>

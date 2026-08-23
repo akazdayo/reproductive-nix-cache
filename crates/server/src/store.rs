@@ -9,8 +9,8 @@ use anyhow::{Context, Result, bail};
 use chrono::{Duration, Utc};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::NotSet, ColumnTrait, ConnectOptions, ConnectionTrait, Database,
-    DatabaseConnection, EntityTrait, ModelTrait, PaginatorTrait, QueryFilter, QueryOrder, Schema,
-    Set, Statement, TransactionTrait, sea_query::Index,
+    DatabaseConnection, EntityTrait, ModelTrait, PaginatorTrait, QueryFilter, QueryOrder,
+    QuerySelect, Schema, Set, Statement, TransactionTrait, sea_query::Index,
 };
 use shared::{
     BuildClaim, BuildOutput, BuildStatement, Claim, CommitmentReceipt, CommitmentRequest, Evidence,
@@ -25,6 +25,7 @@ use tracing::{debug, info};
 
 const BUILD_KIND: &str = "build";
 const LOG_KIND: &str = "log";
+const OVERVIEW_ROUND_LIMIT: u64 = 50;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RoundConfig {
@@ -125,6 +126,14 @@ pub struct MetricsSnapshot {
     pub build_claims: Vec<build_claim::Model>,
     pub build_outputs: Vec<build_output_entity::Model>,
     pub log_claims: Vec<log_claim::Model>,
+}
+
+pub struct OverviewSnapshot {
+    pub rounds: Vec<round::Model>,
+    pub commitments: Vec<commitment::Model>,
+    pub evidences: Vec<evidence_entity::Model>,
+    pub claims: Vec<claim::Model>,
+    pub build_outputs: Vec<build_output_entity::Model>,
 }
 
 impl EvidenceStore {
@@ -946,6 +955,80 @@ impl EvidenceStore {
         };
         transaction.commit().await?;
         Ok(snapshot)
+    }
+
+    pub async fn overview_snapshot(&self, config: RoundConfig) -> Result<OverviewSnapshot> {
+        let now = Utc::now();
+        let open_rounds = round::Entity::find()
+            .filter(round::Column::ClosedAt.is_null())
+            .all(&self.database)
+            .await
+            .context("failed to query open rounds for overview")?;
+        for model in open_rounds {
+            self.advance_round(model, now, config)
+                .await
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        }
+
+        let transaction = self.database.begin().await?;
+        let rounds = round::Entity::find()
+            .order_by_desc(round::Column::Id)
+            .limit(OVERVIEW_ROUND_LIMIT)
+            .all(&transaction)
+            .await?;
+        let round_ids = rounds.iter().map(|round| round.id).collect::<Vec<_>>();
+        let commitments = if round_ids.is_empty() {
+            Vec::new()
+        } else {
+            commitment::Entity::find()
+                .filter(commitment::Column::RoundId.is_in(round_ids))
+                .order_by_asc(commitment::Column::Id)
+                .all(&transaction)
+                .await?
+        };
+        let evidence_ids = commitments
+            .iter()
+            .filter_map(|commitment| commitment.evidence_id)
+            .collect::<Vec<_>>();
+        let evidences = if evidence_ids.is_empty() {
+            Vec::new()
+        } else {
+            evidence_entity::Entity::find()
+                .filter(evidence_entity::Column::Id.is_in(evidence_ids.clone()))
+                .order_by_asc(evidence_entity::Column::Id)
+                .all(&transaction)
+                .await?
+        };
+        let claims = if evidence_ids.is_empty() {
+            Vec::new()
+        } else {
+            claim::Entity::find()
+                .filter(claim::Column::EvidenceId.is_in(evidence_ids))
+                .filter(claim::Column::Kind.eq(BUILD_KIND))
+                .order_by_asc(claim::Column::Id)
+                .all(&transaction)
+                .await?
+        };
+        let claim_ids = claims.iter().map(|claim| claim.id).collect::<Vec<_>>();
+        let build_outputs = if claim_ids.is_empty() {
+            Vec::new()
+        } else {
+            build_output_entity::Entity::find()
+                .filter(build_output_entity::Column::ClaimId.is_in(claim_ids))
+                .order_by_asc(build_output_entity::Column::ClaimId)
+                .order_by_asc(build_output_entity::Column::Position)
+                .all(&transaction)
+                .await?
+        };
+        transaction.commit().await?;
+
+        Ok(OverviewSnapshot {
+            rounds,
+            commitments,
+            evidences,
+            claims,
+            build_outputs,
+        })
     }
 
     pub async fn approved_output(
