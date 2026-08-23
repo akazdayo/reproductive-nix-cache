@@ -15,6 +15,8 @@ use std::{
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
+const BUILDER_REQUEST_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
 #[derive(Clone)]
 pub struct RoundManager {
     sender: mpsc::Sender<QueuedBuild>,
@@ -105,6 +107,7 @@ impl Dispatcher {
         }
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(10))
+            .timeout(BUILDER_REQUEST_TIMEOUT)
             .build()?;
         Ok(Self {
             nodes: nodes.into(),
