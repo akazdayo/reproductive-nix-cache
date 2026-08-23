@@ -18,6 +18,25 @@ commitment digest は `info`、reveal成功後のnonce、Evidence全文、cache 
 記録されます。Evidenceにはビルドのstdout/stderrも含まれるため、共有環境ではログの
 保存先と公開範囲に注意してください。
 
+起動後に `http://127.0.0.1:51337/` を開くと、直近50ラウンドをObsidianのGraph View風に
+表示します。点の大きさは接続数、Builderの塗りはrevealされた結果ハッシュ、外周は
+reveal状態（灰色: waiting、赤: failed、緑: success）を表します。同じ結果ハッシュは
+同じ色の結果ノードへ接続されます。表示データは `GET /v1/overview`、ヘルスチェックは
+`GET /healthz` です。
+
+15 Builderが同一ラウンドへ10件の一致結果と5件の偽結果を送るGraph Viewデモは、
+serverのcommit閾値を15にしてから実行します。このサンプルはBuilder IDごとの
+commit-reveal通信を再現するもので、Nix buildやbuilder-node daemonは起動しません。
+
+```console
+$ cargo run -p server -- \
+    --listen 127.0.0.1:5123 \
+    --database /tmp/reproductive-nix-cache-demo.sqlite \
+    --commit-min-builders 15 \
+    --cache-min-builders 10
+$ python3 examples/demo_15_builders.py
+```
+
 各 builder は事前に `attic push` など、その cache 固有の方法で成果物を投入し、
 Evidence の reveal と同時に `--cache-location` で HTTP(S) cache のベース URI を通知します。
 合意した出力を報告した builder の URI だけが取得候補になり、`.narinfo` が合意結果と
