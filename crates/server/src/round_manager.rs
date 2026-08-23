@@ -4,10 +4,10 @@ use shared::{
     BuildCommand, BuildDispatchOutcome, BuildDispatchResponse, BuildNodeReceipt, BuildQueueReceipt,
 };
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     sync::{
-        Arc,
+        Arc, Mutex, MutexGuard,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -21,6 +21,7 @@ const BUILDER_REQUEST_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 pub struct RoundManager {
     sender: mpsc::Sender<QueuedBuild>,
     next_job_id: Arc<AtomicU64>,
+    metrics: Arc<Mutex<RuntimeMetrics>>,
 }
 
 struct Dispatcher {
@@ -31,6 +32,53 @@ struct Dispatcher {
 struct QueuedBuild {
     job_id: u64,
     command: BuildCommand,
+}
+
+#[derive(Default)]
+struct RuntimeMetrics {
+    queued: BTreeMap<u64, BuildCommand>,
+    active: Option<(u64, BuildCommand)>,
+    jobs_accepted: u64,
+    jobs_rejected_full: u64,
+    jobs_rejected_closed: u64,
+    jobs_started: u64,
+    jobs_completed: u64,
+    nodes: BTreeMap<String, NodeMetrics>,
+}
+
+#[derive(Clone, Default)]
+struct NodeMetrics {
+    active: u64,
+    dispatched: u64,
+    succeeded: u64,
+    failed: u64,
+}
+
+#[derive(Clone)]
+pub struct BuildJobSnapshot {
+    pub job_id: u64,
+    pub command: BuildCommand,
+}
+
+#[derive(Clone)]
+pub struct BuilderNodeSnapshot {
+    pub node: String,
+    pub active: u64,
+    pub dispatched: u64,
+    pub succeeded: u64,
+    pub failed: u64,
+}
+
+pub struct RoundManagerSnapshot {
+    pub queue_capacity: usize,
+    pub queued: Vec<BuildJobSnapshot>,
+    pub active: Option<BuildJobSnapshot>,
+    pub jobs_accepted: u64,
+    pub jobs_rejected_full: u64,
+    pub jobs_rejected_closed: u64,
+    pub jobs_started: u64,
+    pub jobs_completed: u64,
+    pub nodes: Vec<BuilderNodeSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,27 +104,95 @@ impl RoundManager {
             bail!("build queue capacity must be at least 1");
         }
         let dispatcher = Dispatcher::new(nodes)?;
+        let metrics = Arc::new(Mutex::new(RuntimeMetrics {
+            nodes: dispatcher
+                .nodes
+                .iter()
+                .map(|node| (node.to_string(), NodeMetrics::default()))
+                .collect(),
+            ..RuntimeMetrics::default()
+        }));
         let (sender, receiver) = mpsc::channel(queue_capacity);
-        tokio::spawn(run_worker(receiver, dispatcher));
+        tokio::spawn(run_worker(receiver, dispatcher, Arc::clone(&metrics)));
         Ok(Self {
             sender,
             next_job_id: Arc::new(AtomicU64::new(1)),
+            metrics,
         })
     }
 
     pub fn enqueue(&self, command: BuildCommand) -> Result<BuildQueueReceipt, EnqueueError> {
         let job_id = self.next_job_id.fetch_add(1, Ordering::Relaxed);
-        self.sender
-            .try_send(QueuedBuild { job_id, command })
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => EnqueueError::Full,
-                mpsc::error::TrySendError::Closed(_) => EnqueueError::Closed,
-            })?;
-        Ok(BuildQueueReceipt {
-            job_id,
-            queued: true,
-        })
+        let mut metrics = lock_metrics(&self.metrics);
+        metrics.queued.insert(job_id, command.clone());
+        match self.sender.try_send(QueuedBuild { job_id, command }) {
+            Ok(()) => {
+                metrics.jobs_accepted += 1;
+                Ok(BuildQueueReceipt {
+                    job_id,
+                    queued: true,
+                })
+            }
+            Err(error) => {
+                metrics.queued.remove(&job_id);
+                let error = match error {
+                    mpsc::error::TrySendError::Full(_) => {
+                        metrics.jobs_rejected_full += 1;
+                        EnqueueError::Full
+                    }
+                    mpsc::error::TrySendError::Closed(_) => {
+                        metrics.jobs_rejected_closed += 1;
+                        EnqueueError::Closed
+                    }
+                };
+                Err(error)
+            }
+        }
     }
+
+    pub fn metrics_snapshot(&self) -> RoundManagerSnapshot {
+        let metrics = lock_metrics(&self.metrics);
+        RoundManagerSnapshot {
+            queue_capacity: self.sender.max_capacity(),
+            queued: metrics
+                .queued
+                .iter()
+                .map(|(&job_id, command)| BuildJobSnapshot {
+                    job_id,
+                    command: command.clone(),
+                })
+                .collect(),
+            active: metrics
+                .active
+                .as_ref()
+                .map(|(job_id, command)| BuildJobSnapshot {
+                    job_id: *job_id,
+                    command: command.clone(),
+                }),
+            jobs_accepted: metrics.jobs_accepted,
+            jobs_rejected_full: metrics.jobs_rejected_full,
+            jobs_rejected_closed: metrics.jobs_rejected_closed,
+            jobs_started: metrics.jobs_started,
+            jobs_completed: metrics.jobs_completed,
+            nodes: metrics
+                .nodes
+                .iter()
+                .map(|(node, values)| BuilderNodeSnapshot {
+                    node: node.clone(),
+                    active: values.active,
+                    dispatched: values.dispatched,
+                    succeeded: values.succeeded,
+                    failed: values.failed,
+                })
+                .collect(),
+        }
+    }
+}
+
+fn lock_metrics(metrics: &Mutex<RuntimeMetrics>) -> MutexGuard<'_, RuntimeMetrics> {
+    metrics
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl Dispatcher {
@@ -135,8 +251,23 @@ impl Dispatcher {
     }
 }
 
-async fn run_worker(mut receiver: mpsc::Receiver<QueuedBuild>, dispatcher: Dispatcher) {
+async fn run_worker(
+    mut receiver: mpsc::Receiver<QueuedBuild>,
+    dispatcher: Dispatcher,
+    metrics: Arc<Mutex<RuntimeMetrics>>,
+) {
     while let Some(job) = receiver.recv().await {
+        {
+            let mut metrics = lock_metrics(&metrics);
+            metrics.queued.remove(&job.job_id);
+            metrics.active = Some((job.job_id, job.command.clone()));
+            metrics.jobs_started += 1;
+            for node in dispatcher.nodes.iter() {
+                let node = metrics.nodes.entry(node.to_string()).or_default();
+                node.active += 1;
+                node.dispatched += 1;
+            }
+        }
         info!(
             job_id = job.job_id,
             package_ref = %job.command.package_ref,
@@ -145,7 +276,7 @@ async fn run_worker(mut receiver: mpsc::Receiver<QueuedBuild>, dispatcher: Dispa
         );
         let response = dispatcher.dispatch(&job.command).await;
         let mut succeeded = 0;
-        for outcome in response.builders {
+        for outcome in &response.builders {
             if outcome.success {
                 succeeded += 1;
                 info!(
@@ -164,6 +295,20 @@ async fn run_worker(mut receiver: mpsc::Receiver<QueuedBuild>, dispatcher: Dispa
                     "builder failed build"
                 );
             }
+        }
+        {
+            let mut metrics = lock_metrics(&metrics);
+            for outcome in &response.builders {
+                let node = metrics.nodes.entry(outcome.node.clone()).or_default();
+                node.active = node.active.saturating_sub(1);
+                if outcome.success {
+                    node.succeeded += 1;
+                } else {
+                    node.failed += 1;
+                }
+            }
+            metrics.active = None;
+            metrics.jobs_completed += 1;
         }
         info!(
             job_id = job.job_id,
@@ -333,6 +478,16 @@ mod tests {
         let second = manager.enqueue(command.clone()).unwrap();
         assert_eq!(second.job_id, 2);
         assert_eq!(manager.enqueue(command), Err(EnqueueError::Full));
+        let snapshot = manager.metrics_snapshot();
+        assert_eq!(snapshot.queue_capacity, 1);
+        assert_eq!(snapshot.queued.len(), 1);
+        assert_eq!(snapshot.queued[0].job_id, 2);
+        assert_eq!(snapshot.active.as_ref().unwrap().job_id, 1);
+        assert_eq!(snapshot.jobs_accepted, 2);
+        assert_eq!(snapshot.jobs_rejected_full, 1);
+        assert_eq!(snapshot.jobs_started, 1);
+        assert_eq!(snapshot.nodes[0].active, 1);
+        assert_eq!(snapshot.nodes[0].dispatched, 1);
         release.notify_one();
     }
 

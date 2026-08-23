@@ -1,13 +1,15 @@
 use crate::{
     binary_cache::{BinaryCache, CACHE_INFO},
+    metrics::{self, ExportContext, HttpMetrics, ServerMetadata},
     round_manager::RoundManager,
     store::{EvidenceStore, ProtocolError, RoundConfig},
 };
 use axum::{
     Json, Router,
     body::Body,
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{DefaultBodyLimit, MatchedPath, Path, Query, Request, State},
     http::{StatusCode, header},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -16,7 +18,10 @@ use shared::{
     BuildCommand, BuildQueueReceipt, CommitmentReceipt, CommitmentRequest, EvidenceList,
     EvidenceReceipt, EvidenceReveal, RoundStatus,
 };
+use std::time::Instant;
 use tracing::warn;
+
+const UNMATCHED_ROUTE: &str = "unmatched";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -24,6 +29,8 @@ pub struct AppState {
     binary_cache: Option<BinaryCache>,
     round_config: RoundConfig,
     round_manager: Option<RoundManager>,
+    http_metrics: HttpMetrics,
+    server_metadata: ServerMetadata,
 }
 
 impl AppState {
@@ -33,6 +40,8 @@ impl AppState {
             binary_cache: None,
             round_config: RoundConfig::default(),
             round_manager: None,
+            http_metrics: HttpMetrics::default(),
+            server_metadata: ServerMetadata::default(),
         }
     }
 
@@ -51,6 +60,11 @@ impl AppState {
         self
     }
 
+    pub fn with_server_metadata(mut self, server_metadata: ServerMetadata) -> Self {
+        self.server_metadata = server_metadata;
+        self
+    }
+
     #[cfg(test)]
     async fn in_memory() -> anyhow::Result<Self> {
         Ok(Self::new(EvidenceStore::in_memory().await?))
@@ -58,8 +72,10 @@ impl AppState {
 }
 
 pub fn router(state: AppState) -> Router {
+    let http_metrics = state.http_metrics.clone();
     Router::new()
         .route("/", get(health))
+        .route("/metrics", get(prometheus_metrics))
         .route("/v1/evidence", get(list_evidence))
         .route("/v1/builds", post(dispatch_build))
         .route("/v1/evidence/commitments", post(commit_evidence))
@@ -78,10 +94,55 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/{key}", get(get_narinfo).head(head_narinfo))
         .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            http_metrics,
+            record_http_metrics,
+        ))
 }
 
 async fn health() -> &'static str {
     "ok"
+}
+
+async fn prometheus_metrics(State(state): State<AppState>) -> ApiResult<Response> {
+    let body = metrics::encode(ExportContext {
+        store: &state.store,
+        round_config: state.round_config,
+        cache_minimum_builders: state
+            .binary_cache
+            .as_ref()
+            .map(BinaryCache::minimum_builders),
+        round_manager: state.round_manager.as_ref(),
+        http: &state.http_metrics,
+        server: &state.server_metadata,
+    })
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(([(header::CONTENT_TYPE, metrics::CONTENT_TYPE)], body).into_response())
+}
+
+async fn record_http_metrics(
+    State(metrics): State<HttpMetrics>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let method = request.method().as_str().to_owned();
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(MatchedPath::as_str)
+        .unwrap_or(UNMATCHED_ROUTE)
+        .to_owned();
+    let _active_request = metrics.begin_request();
+    let started_at = Instant::now();
+    let response = next.run(request).await;
+    metrics.observe_request(
+        &method,
+        &route,
+        response.status().as_u16(),
+        started_at.elapsed(),
+    );
+    response
 }
 
 async fn dispatch_build(
@@ -1367,5 +1428,109 @@ mod tests {
             to_bytes(response.into_body(), usize::MAX).await.unwrap(),
             CACHE_INFO
         );
+    }
+
+    #[tokio::test]
+    async fn metrics_exposes_runtime_config_and_every_stored_table() {
+        let upstream = spawn_upstream(narinfo(CACHE_NAR_HASH_NIX32)).await;
+        let app = cache_app_with_locations(
+            1,
+            vec![(
+                cache_evidence("builder-\"a", CACHE_NAR_HASH_SRI),
+                vec![upstream],
+            )],
+        )
+        .await;
+        let health = app
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            metrics::CONTENT_TYPE
+        );
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+
+        for expected in [
+            "reproductive_nix_cache_build_info{version=\"0.1.0\"} 1",
+            "reproductive_nix_cache_http_requests_active 1",
+            "reproductive_nix_cache_http_requests_total{method=\"GET\",route=\"/\",status=\"200\"} 1",
+            "reproductive_nix_cache_store_records{table=\"commit_reveal_rounds\"} 1",
+            "reproductive_nix_cache_store_records{table=\"evidence_commitments\"} 1",
+            "reproductive_nix_cache_store_records{table=\"evidences\"} 1",
+            "reproductive_nix_cache_store_records{table=\"cache_locations\"} 1",
+            "reproductive_nix_cache_store_records{table=\"claims\"} 2",
+            "reproductive_nix_cache_store_records{table=\"build_claims\"} 1",
+            "reproductive_nix_cache_store_records{table=\"build_outputs\"} 1",
+            "reproductive_nix_cache_store_records{table=\"log_claims\"} 1",
+            "reproductive_nix_cache_round_info{round_id=\"1\",derivation_path=\"/nix/store/example-hello.drv\",phase=\"completed\",expired=\"false\"} 1",
+            "reproductive_nix_cache_commitment_info{commitment_id=\"1\",round_id=\"1\",builder_id=\"builder-\\\"a\"",
+            "reproductive_nix_cache_evidence_info{evidence_id=\"1\"",
+            "reproductive_nix_cache_cache_location_info{location_id=\"1\"",
+            "reproductive_nix_cache_claim_info{claim_id=\"1\"",
+            "reproductive_nix_cache_build_claim_info{claim_id=\"1\"",
+            "reproductive_nix_cache_build_output_info{claim_id=\"1\"",
+            "reproductive_nix_cache_log_claim_info{claim_id=\"2\",stdout=\"stdout\\n\",stderr=\"stderr\\n\"} 1",
+        ] {
+            assert!(
+                body.contains(expected),
+                "missing metric: {expected}\n{body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_collapses_unmatched_paths_into_one_label() {
+        let app = router(AppState::in_memory().await.unwrap());
+        for path in ["/missing/one", "/missing/two"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+
+        assert!(body.contains(
+            "reproductive_nix_cache_http_requests_total{method=\"GET\",route=\"unmatched\",status=\"404\"} 2"
+        ));
+        assert!(!body.contains("/missing/one"));
+        assert!(!body.contains("/missing/two"));
     }
 }

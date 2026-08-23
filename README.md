@@ -79,6 +79,54 @@ serverの標準エラー出力へ表示されます。キューは永続化さ�
 `--commit-window-seconds` を超えないよう、実際のビルド時間に合わせてwindowを
 設定してください。
 
+## Prometheus metrics
+
+`GET /metrics` は認証なしで Prometheus text format を返します。
+
+```console
+$ curl http://127.0.0.1:51337/metrics
+```
+
+起動設定、HTTP件数と所要時間、build queue、Builder Nodeごとの実行結果、SQLiteの
+全テーブルを公開します。保存済みの文字列は `*_info` のlabelになり、Evidenceの
+stdout/stderr、commitment digest、reveal済みnonce、cache URIも含まれます。そのため
+scrape先では全情報を取得できる前提で運用し、履歴が増えるほど時系列数とresponse sizeも
+増えることに注意してください。
+
+```yaml
+scrape_configs:
+  - job_name: reproductive-nix-cache
+    static_configs:
+      - targets: ["127.0.0.1:51337"]
+```
+
+## Grafana dashboard
+
+`monitoring/compose.yaml` で Prometheus と Grafana を起動できます。server は先に
+`127.0.0.1:51337` で起動してください。Docker の host network を使い、server と
+Prometheusはlocalhost限定、Grafanaは全network interfaceの3000番portで待ち受けます。
+
+```console
+$ docker compose -f monitoring/compose.yaml up -d
+```
+
+Grafana は `http://<server-address>:3000/d/reproductive-nix-cache/reproductive-nix-cache`、
+Prometheus は <http://127.0.0.1:9090> です。Grafana の初期ログインは
+`admin` / `admin` です。外部から到達できるため、firewallで公開範囲を制限し、
+永続volumeを初めて作る前に管理者パスワードを変更してください。
+
+```console
+$ GRAFANA_ADMIN_PASSWORD='replace-me' \
+    docker compose -f monitoring/compose.yaml up -d
+```
+
+Prometheus datasourceとreproductive-nix-cache dashboardは起動時に自動設定されます。
+停止してもメトリクス履歴とGrafana設定はnamed volumeへ残ります。
+
+```console
+$ docker compose -f monitoring/compose.yaml down
+```
+
 ## Nix Binary Cache として使う
 
 ```nix
