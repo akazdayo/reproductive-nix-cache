@@ -2,11 +2,13 @@
 
 ## Project Structure & Module Organization
 
-This Rust 2024 workspace contains three crates:
+This Rust 2024 workspace contains five crates:
 
-- `crates/cli`: the `reproductive-nix-cache` command. Build orchestration lives under `src/build/`; registry access, claims, trust calculation, and output formatting are separate modules.
+- `crates/cli`: the `reproductive-nix-cache` command. It is a thin wrapper around `builder-core` with trust calculation and human/JSON output.
+- `crates/builder-core`: Nix build, evidence generation, and commit-reveal orchestration shared by the CLI and builder node.
+- `crates/builder-node`: the authenticated, single-flight HTTP daemon that executes build commands.
 - `crates/server`: the Axum registry and binary-cache gateway. API routes, SQLite persistence, configuration, and HTTP upstream access are split by module.
-- `crates/shared`: evidence types shared by both binaries.
+- `crates/shared`: evidence and HTTP wire types shared across binaries.
 
 Tests are colocated with implementation code in `#[cfg(test)]` modules. Root files include the workspace manifests, Nix flake, licenses, and a short usage-oriented `README.md`.
 

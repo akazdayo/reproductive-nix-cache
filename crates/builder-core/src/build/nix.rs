@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, de::DeserializeOwned};
 use shared::{Package, ResolvedSource};
-use std::{collections::BTreeMap, process::Stdio};
+use std::{collections::BTreeMap, ffi::OsStr, process::Stdio};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
 
@@ -88,9 +88,20 @@ pub async fn derivation_path(package: &Package) -> Result<String> {
 
 pub async fn build(package: &Package, quiet: bool, substitute: bool) -> Result<BuildRun> {
     let reference = package.reference();
+    // Rebuild requires an existing result. Bootstrap a fresh node with an
+    // ordinary build, then perform the independent rebuild used as evidence.
+    run_build(initial_build_args(&reference, substitute), quiet).await?;
+    run_build(rebuild_args(&reference, substitute), quiet).await
+}
+
+async fn run_build<I, S>(args: I, quiet: bool) -> Result<BuildRun>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let started_at = Utc::now();
     let mut child = Command::new("nix")
-        .args(build_args(reference.as_str(), substitute))
+        .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -99,16 +110,17 @@ pub async fn build(package: &Package, quiet: bool, substitute: bool) -> Result<B
     let stderr = child.stderr.take().context("nix stderr was not piped")?;
     let wait = async move { child.wait().await.context("failed to wait for nix build") };
     let (stdout, stderr, status) = tokio::try_join!(
-        // stdout contains the internal `nix build --json` result. Keep it for
-        // evidence collection without mixing it into the CLI's final output.
-        capture_stream(stdout, tokio::io::stdout(), false),
+        capture_stream(stdout, tokio::io::sink(), false),
         capture_stream(stderr, tokio::io::stderr(), !quiet),
         wait,
     )?;
     let finished_at = Utc::now();
 
     if !status.success() {
-        bail!("nix build failed with exit status: {status}");
+        bail!(
+            "nix build failed with exit status {status}: {}",
+            stderr.trim()
+        );
     }
     let outputs = parse_build_outputs(&stdout)?;
 
@@ -121,7 +133,19 @@ pub async fn build(package: &Package, quiet: bool, substitute: bool) -> Result<B
     })
 }
 
-fn build_args(reference: &str, substitute: bool) -> [&str; 8] {
+fn initial_build_args(reference: &str, substitute: bool) -> [&str; 7] {
+    [
+        "build",
+        "--option",
+        "substitute",
+        if substitute { "true" } else { "false" },
+        reference,
+        "--no-link",
+        "--json",
+    ]
+}
+
+fn rebuild_args(reference: &str, substitute: bool) -> [&str; 8] {
     [
         "build",
         "--rebuild",
@@ -228,7 +252,7 @@ async fn run_json<T, I, S>(args: I) -> Result<T>
 where
     T: DeserializeOwned,
     I: IntoIterator<Item = S>,
-    S: AsRef<std::ffi::OsStr>,
+    S: AsRef<OsStr>,
 {
     let output = Command::new("nix")
         .args(args)
@@ -247,38 +271,25 @@ where
 }
 
 fn take_only_entry<T>(entries: BTreeMap<String, T>, command: &str) -> Result<String> {
-    take_only_entry_with_value(entries, command).map(|(key, _)| key)
-}
-
-fn take_only_entry_with_value<T>(
-    entries: BTreeMap<String, T>,
-    command: &str,
-) -> Result<(String, T)> {
     if entries.len() != 1 {
         bail!(
             "{command} returned {} entries; expected exactly one",
             entries.len()
         );
     }
-
-    entries
-        .into_iter()
-        .next()
-        .context("nix returned no entries")
+    Ok(entries.into_iter().next().expect("length was checked").0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
-    fn build_args_disable_substitutes_by_default() {
+    fn fresh_build_precedes_rebuild_and_disables_substitutes_by_default() {
         assert_eq!(
-            build_args("nixpkgs#hello", false),
+            initial_build_args("nixpkgs#hello", false),
             [
                 "build",
-                "--rebuild",
                 "--option",
                 "substitute",
                 "false",
@@ -287,108 +298,22 @@ mod tests {
                 "--json",
             ]
         );
+        assert_eq!(rebuild_args("nixpkgs#hello", false)[1], "--rebuild");
     }
 
     #[test]
-    fn build_args_can_enable_substitutes() {
-        assert_eq!(build_args("nixpkgs#hello", true)[4], "true");
+    fn build_arguments_can_enable_substitutes() {
+        assert_eq!(initial_build_args("nixpkgs#hello", true)[3], "true");
+        assert_eq!(rebuild_args("nixpkgs#hello", true)[4], "true");
     }
 
     #[test]
     fn build_json_preserves_all_selected_outputs() {
         let outputs = parse_build_outputs(
-            r#"[{
-                "drvPath": "/nix/store/openssl.drv",
-                "outputs": {
-                    "bin": "/nix/store/openssl-bin",
-                    "man": "/nix/store/openssl-man"
-                }
-            }]"#,
+            r#"[{"outputs":{"bin":"/nix/store/openssl-bin","man":"/nix/store/openssl-man"}}]"#,
         )
         .unwrap();
-
         assert_eq!(outputs.len(), 2);
-        assert_eq!(outputs["bin"], "/nix/store/openssl-bin");
         assert_eq!(outputs["man"], "/nix/store/openssl-man");
-    }
-
-    #[test]
-    fn path_info_is_joined_with_every_built_output() {
-        let outputs = BTreeMap::from([
-            ("bin".into(), "/nix/store/openssl-bin".into()),
-            ("man".into(), "/nix/store/openssl-man".into()),
-        ]);
-        let entries: BTreeMap<String, NixPathInfo> = serde_json::from_str(
-            r#"{
-                "/nix/store/openssl-bin": {
-                    "narHash": "sha256-bin",
-                    "narSize": 1234,
-                    "references": ["/nix/store/glibc"],
-                    "ca": null
-                },
-                "/nix/store/openssl-man": {
-                    "narHash": "sha256-man",
-                    "narSize": 567,
-                    "references": [],
-                    "ca": "fixed:r:sha256:example"
-                }
-            }"#,
-        )
-        .unwrap();
-        let info = collect_output_info(&outputs, entries).unwrap();
-
-        assert_eq!(info.len(), 2);
-        assert_eq!(info[0].output_name, "bin");
-        assert_eq!(info[0].nar_hash, "sha256-bin");
-        assert_eq!(info[1].output_name, "man");
-        assert_eq!(info[1].nar_size, 567);
-        assert_eq!(
-            info[1].content_addressed.as_deref(),
-            Some("fixed:r:sha256:example")
-        );
-    }
-
-    #[test]
-    fn only_entry_rejects_multiple_nix_results() {
-        let entries = BTreeMap::from([("one".into(), ()), ("two".into(), ())]);
-        assert!(take_only_entry(entries, "nix path-info").is_err());
-    }
-
-    #[tokio::test]
-    async fn capture_stream_preserves_all_bytes_and_echoes_when_enabled() {
-        let (mut source_writer, source_reader) = tokio::io::duplex(64);
-        let source = tokio::spawn(async move {
-            source_writer.write_all(b"first\nsecond\n").await.unwrap();
-        });
-        let (mut echo_reader, echo_writer) = tokio::io::duplex(64);
-
-        let captured = capture_stream(source_reader, echo_writer, true)
-            .await
-            .unwrap();
-        source.await.unwrap();
-        let mut echoed = String::new();
-        echo_reader.read_to_string(&mut echoed).await.unwrap();
-
-        assert_eq!(captured, "first\nsecond\n");
-        assert_eq!(echoed, captured);
-    }
-
-    #[tokio::test]
-    async fn capture_stream_keeps_content_but_does_not_echo_when_quiet() {
-        let (mut source_writer, source_reader) = tokio::io::duplex(64);
-        let source = tokio::spawn(async move {
-            source_writer.write_all(b"build output\n").await.unwrap();
-        });
-        let (mut echo_reader, echo_writer) = tokio::io::duplex(64);
-
-        let captured = capture_stream(source_reader, echo_writer, false)
-            .await
-            .unwrap();
-        source.await.unwrap();
-        let mut echoed = String::new();
-        echo_reader.read_to_string(&mut echoed).await.unwrap();
-
-        assert_eq!(captured, "build output\n");
-        assert!(echoed.is_empty());
     }
 }

@@ -1,26 +1,31 @@
 use crate::{
     binary_cache::{BinaryCache, CACHE_INFO},
+    round_manager::RoundManager,
     store::{EvidenceStore, ProtocolError, RoundConfig},
 };
 use axum::{
     Json, Router,
     body::Body,
     extract::{DefaultBodyLimit, Path, Query, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use shared::{
-    CommitmentReceipt, CommitmentRequest, EvidenceList, EvidenceReceipt, EvidenceReveal,
-    RoundStatus,
+    BuildCommand, BuildQueueReceipt, CommitmentReceipt, CommitmentRequest, EvidenceList,
+    EvidenceReceipt, EvidenceReveal, RoundStatus,
 };
+use std::sync::Arc;
+use tracing::warn;
 
 #[derive(Clone)]
 pub struct AppState {
     store: EvidenceStore,
     binary_cache: Option<BinaryCache>,
     round_config: RoundConfig,
+    round_manager: Option<RoundManager>,
+    manager_token: Option<Arc<str>>,
 }
 
 impl AppState {
@@ -29,6 +34,8 @@ impl AppState {
             store,
             binary_cache: None,
             round_config: RoundConfig::default(),
+            round_manager: None,
+            manager_token: None,
         }
     }
 
@@ -42,6 +49,16 @@ impl AppState {
         self
     }
 
+    pub fn with_round_manager(
+        mut self,
+        round_manager: RoundManager,
+        manager_token: String,
+    ) -> Self {
+        self.round_manager = Some(round_manager);
+        self.manager_token = Some(manager_token.into());
+        self
+    }
+
     #[cfg(test)]
     async fn in_memory() -> anyhow::Result<Self> {
         Ok(Self::new(EvidenceStore::in_memory().await?))
@@ -52,6 +69,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(health))
         .route("/v1/evidence", get(list_evidence))
+        .route("/v1/builds", post(dispatch_build))
         .route("/v1/evidence/commitments", post(commit_evidence))
         .route(
             "/v1/evidence/reveals",
@@ -72,6 +90,38 @@ pub fn router(state: AppState) -> Router {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+async fn dispatch_build(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(command): Json<BuildCommand>,
+) -> ApiResult<(StatusCode, Json<BuildQueueReceipt>)> {
+    let manager = state
+        .round_manager
+        .as_ref()
+        .ok_or_else(|| ApiError::service_unavailable("no builder nodes are configured"))?;
+    let token = state
+        .manager_token
+        .as_deref()
+        .ok_or_else(|| ApiError::internal("round manager token is missing"))?;
+    if !authorized(&headers, token) {
+        return Err(ApiError::unauthorized("invalid bearer token"));
+    }
+    command.validate().map_err(ApiError::bad_request)?;
+
+    let receipt = manager
+        .enqueue(command)
+        .map_err(ApiError::service_unavailable)?;
+    Ok((StatusCode::ACCEPTED, Json(receipt)))
+}
+
+fn authorized(headers: &HeaderMap, expected: &str) -> bool {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|token| !expected.is_empty() && token == expected)
 }
 
 async fn commit_evidence(
@@ -311,6 +361,20 @@ impl ApiError {
         }
     }
 
+    fn unauthorized(error: impl std::fmt::Display) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: error.to_string(),
+        }
+    }
+
+    fn service_unavailable(error: impl std::fmt::Display) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: error.to_string(),
+        }
+    }
+
     fn not_found(error: impl std::fmt::Display) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
@@ -335,6 +399,7 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        warn!(status = %self.status, error = %self.message, "request failed");
         (
             self.status,
             Json(ErrorResponse {
@@ -359,9 +424,9 @@ mod tests {
     };
     use chrono::{Duration, Utc};
     use shared::{
-        BuildClaim, BuildOutput, BuildStatement, CacheLocation, Claim, EVIDENCE_SCHEMA_VERSION,
-        Evidence, EvidenceReceipt, EvidenceReveal, LogClaim, Package, ResolvedSource,
-        evidence_commitment, generate_nonce,
+        BuildClaim, BuildCommand, BuildNodeReceipt, BuildOutput, BuildStatement, CacheLocation,
+        Claim, EVIDENCE_SCHEMA_VERSION, Evidence, EvidenceReceipt, EvidenceReveal, LogClaim,
+        Package, ResolvedSource, evidence_commitment, generate_nonce,
     };
     use tokio::net::TcpListener;
     use tower::ServiceExt;
@@ -483,6 +548,32 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        reqwest::Url::parse(&format!("http://{address}/")).unwrap()
+    }
+
+    async fn spawn_builder_node(status: StatusCode) -> reqwest::Url {
+        let app = Router::new().route(
+            "/v1/builds",
+            post(
+                move |headers: HeaderMap, Json(_): Json<BuildCommand>| async move {
+                    assert_eq!(
+                        headers.get(header::AUTHORIZATION).unwrap(),
+                        "Bearer builder-secret"
+                    );
+                    (
+                        status,
+                        Json(BuildNodeReceipt {
+                            builder_id: "builder-a".into(),
+                            round_id: 7,
+                            evidence_id: 42,
+                        }),
+                    )
+                },
+            ),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         reqwest::Url::parse(&format!("http://{address}/")).unwrap()
     }
 
@@ -634,6 +725,108 @@ mod tests {
 
     async fn cache_app(minimum_builders: usize, evidence: Vec<Evidence>) -> Router {
         cache_app_with_narinfo(minimum_builders, evidence, narinfo(CACHE_NAR_HASH_NIX32)).await
+    }
+
+    #[tokio::test]
+    async fn round_manager_enforces_auth_validates_commands_and_queues_work() {
+        let command = BuildCommand {
+            package_ref: "nixpkgs#hello".into(),
+            substitute: false,
+            claims: vec![],
+        };
+        let unavailable = router(AppState::in_memory().await.unwrap());
+        let response = unavailable
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/builds")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&command).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let node = spawn_builder_node(StatusCode::OK).await;
+        let manager = RoundManager::new(vec![node], "builder-secret".into(), 64).unwrap();
+        let app = router(
+            AppState::in_memory()
+                .await
+                .unwrap()
+                .with_round_manager(manager, "manager-secret".into()),
+        );
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/builds")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&command).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let mut invalid = command.clone();
+        invalid.package_ref = "invalid".into();
+        let invalid = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/builds")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer manager-secret")
+                    .body(Body::from(serde_json::to_vec(&invalid).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+        let successful = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/builds")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer manager-secret")
+                    .body(Body::from(serde_json::to_vec(&command).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(successful.status(), StatusCode::ACCEPTED);
+        let body = to_bytes(successful.into_body(), usize::MAX).await.unwrap();
+        let receipt: BuildQueueReceipt = serde_json::from_slice(&body).unwrap();
+        assert_eq!(receipt.job_id, 1);
+        assert!(receipt.queued);
+
+        let failing_node = spawn_builder_node(StatusCode::CONFLICT).await;
+        let failing_manager =
+            RoundManager::new(vec![failing_node], "builder-secret".into(), 64).unwrap();
+        let failing = router(
+            AppState::in_memory()
+                .await
+                .unwrap()
+                .with_round_manager(failing_manager, "manager-secret".into()),
+        );
+        let failed = failing
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/builds")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer manager-secret")
+                    .body(Body::from(serde_json::to_vec(&command).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(failed.status(), StatusCode::ACCEPTED);
     }
 
     #[tokio::test]

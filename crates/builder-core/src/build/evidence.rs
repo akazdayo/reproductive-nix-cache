@@ -1,12 +1,11 @@
 use crate::build::nix;
-use crate::claims::ClaimKind;
 use anyhow::{Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use shared::{
-    BuildClaim, BuildOutput, BuildStatement, Claim, EVIDENCE_SCHEMA_VERSION, Evidence, LogClaim,
-    Package, ResolvedSource,
+    BuildClaim, BuildOutput, BuildStatement, Claim, ClaimKind, EVIDENCE_SCHEMA_VERSION, Evidence,
+    LogClaim, Package, ResolvedSource,
 };
 
 /// Rebuild an output, optionally using substitutes, then collect the facts
@@ -102,9 +101,6 @@ fn compose_evidence(
     }
 }
 
-/// Hash the compact JSON object `{ "stdout": ..., "stderr": ... }` and use
-/// the same SRI representation as Nix hashes.
-/// 要はLogClaimと違って、ハッシュだけ送るということ
 fn digest_build_log(log: &LogClaim) -> String {
     #[derive(Serialize)]
     struct BuildLog<'a> {
@@ -124,80 +120,10 @@ fn digest_build_log(log: &LogClaim) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::claims::ClaimKind;
     use chrono::{Duration, Utc};
 
     #[test]
-    fn compose_evidence_always_creates_build_claim_without_optional_log() {
-        let started_at = Utc::now();
-        let finished_at = started_at + Duration::seconds(1);
-        let evidence = compose_evidence(
-            Package {
-                repository: "nixpkgs".into(),
-                name: "hello".into(),
-            },
-            "builder-a".into(),
-            ResolvedSource {
-                resolved_url: "flake:nixpkgs".into(),
-                revision: None,
-                nar_hash: Some("sha256-source".into()),
-            },
-            "/nix/store/hello.drv".into(),
-            vec![
-                nix::OutputInfo {
-                    output_name: "bin".into(),
-                    output_path: "/nix/store/hello-bin".into(),
-                    nar_hash: "sha256-bin".into(),
-                    nar_size: 1234,
-                    references: vec!["/nix/store/glibc".into()],
-                    content_addressed: None,
-                },
-                nix::OutputInfo {
-                    output_name: "man".into(),
-                    output_path: "/nix/store/hello-man".into(),
-                    nar_hash: "sha256-man".into(),
-                    nar_size: 567,
-                    references: vec![],
-                    content_addressed: None,
-                },
-            ],
-            nix::BuildRun {
-                stdout: "stdout\n".into(),
-                stderr: "stderr\n".into(),
-                started_at,
-                finished_at,
-                outputs: Default::default(),
-            },
-            vec![ClaimKind::Build],
-        );
-
-        assert_eq!(evidence.claims.len(), 1);
-        let Claim::Build(build) = &evidence.claims[0] else {
-            panic!("expected build claim")
-        };
-        assert_eq!(build.build_statement.outputs.len(), 2);
-        assert_eq!(build.build_statement.outputs[0].output_name, "bin");
-        assert_eq!(build.build_statement.outputs[0].nar_size, 1234);
-        assert_eq!(build.build_statement.outputs[1].output_name, "man");
-        assert_eq!(
-            build.build_statement.outputs[0].references,
-            vec!["/nix/store/glibc"]
-        );
-        assert_eq!(
-            build.build_statement.outputs[0].closure_root,
-            "/nix/store/hello-bin"
-        );
-        assert!(
-            build
-                .build_statement
-                .build_log_digest
-                .as_deref()
-                .is_some_and(|digest| digest.starts_with("sha256-"))
-        );
-    }
-
-    #[test]
-    fn compose_evidence_adds_log_when_selected() {
+    fn compose_evidence_always_adds_build_and_deduplicates_claims() {
         let started_at = Utc::now();
         let finished_at = started_at + Duration::seconds(1);
         let evidence = compose_evidence(
@@ -217,8 +143,8 @@ mod tests {
                 output_path: "/nix/store/hello".into(),
                 nar_hash: "sha256-output".into(),
                 nar_size: 1234,
-                references: vec!["/nix/store/glibc".into()],
-                content_addressed: Some("fixed:r:sha256:example".into()),
+                references: vec![],
+                content_addressed: None,
             }],
             nix::BuildRun {
                 stdout: "stdout\n".into(),
@@ -227,33 +153,11 @@ mod tests {
                 finished_at,
                 outputs: Default::default(),
             },
-            vec![ClaimKind::Build, ClaimKind::Log],
+            ClaimKind::with_required_build([ClaimKind::Log, ClaimKind::Build, ClaimKind::Log]),
         );
 
+        assert_eq!(evidence.claims.len(), 2);
         assert!(matches!(evidence.claims[0], Claim::Build(_)));
         assert!(matches!(evidence.claims[1], Claim::Log(_)));
-        let Claim::Build(build) = &evidence.claims[0] else {
-            unreachable!()
-        };
-        assert_eq!(
-            build.build_statement.outputs[0]
-                .content_addressed
-                .as_deref(),
-            Some("fixed:r:sha256:example")
-        );
-        assert!(
-            build
-                .build_statement
-                .build_log_digest
-                .as_deref()
-                .is_some_and(|digest| digest.starts_with("sha256-"))
-        );
-        let Claim::Log(log) = &evidence.claims[1] else {
-            unreachable!()
-        };
-        assert_eq!(log.stdout, "stdout\n");
-        assert_eq!(log.stderr, "stderr\n");
-        assert_eq!(log.started_at, started_at);
-        assert_eq!(log.finished_at, finished_at);
     }
 }

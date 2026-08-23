@@ -21,6 +21,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
 };
+use tracing::{debug, info};
 
 const BUILD_KIND: &str = "build";
 const LOG_KIND: &str = "log";
@@ -367,13 +368,23 @@ impl EvidenceStore {
             .exec(&self.database)
             .await;
             match insert {
-                Ok(result) => round::Entity::find_by_id(result.last_insert_id)
-                    .one(&self.database)
-                    .await
-                    .map_err(ProtocolError::internal)?
-                    .ok_or_else(|| {
-                        ProtocolError::internal(anyhow::anyhow!("created round was not found"))
-                    })?,
+                Ok(result) => {
+                    let created = round::Entity::find_by_id(result.last_insert_id)
+                        .one(&self.database)
+                        .await
+                        .map_err(ProtocolError::internal)?
+                        .ok_or_else(|| {
+                            ProtocolError::internal(anyhow::anyhow!("created round was not found"))
+                        })?;
+                    info!(
+                        round_id = created.id,
+                        derivation_path = %created.derivation_path,
+                        commit_deadline = %created.commit_deadline,
+                        minimum_builders = config.minimum_builders,
+                        "commit-reveal round started"
+                    );
+                    created
+                }
                 Err(_) => round::Entity::find()
                     .filter(round::Column::DerivationPath.eq(&request.derivation_path))
                     .filter(round::Column::ClosedAt.is_null())
@@ -431,14 +442,30 @@ impl EvidenceStore {
             .count(&self.database)
             .await
             .map_err(ProtocolError::internal)?;
+        info!(
+            round_id = active.id,
+            builder_id = %request.builder_id,
+            commitment_digest = %request.digest,
+            commit_count = count,
+            minimum_builders = config.minimum_builders,
+            "commitment accepted"
+        );
+
         let active = if usize::try_from(count).unwrap_or(usize::MAX) >= config.minimum_builders {
             let mut update: round::ActiveModel = active.into();
             update.reveal_started_at = Set(Some(now));
             update.reveal_deadline = Set(Some(now + config.reveal_window));
-            update
+            let active = update
                 .update(&self.database)
                 .await
-                .map_err(ProtocolError::internal)?
+                .map_err(ProtocolError::internal)?;
+            info!(
+                round_id = active.id,
+                commit_count = count,
+                reveal_deadline = ?active.reveal_deadline,
+                "commit threshold reached; reveal phase started"
+            );
+            active
         } else {
             active
         };
@@ -589,6 +616,42 @@ impl EvidenceStore {
             .await
             .map_err(ProtocolError::internal)?;
 
+        let outputs = &reveal
+            .evidence
+            .build_claim()
+            .expect("validated evidence has exactly one build claim")
+            .build_statement
+            .outputs;
+        let output_results = outputs
+            .iter()
+            .map(|output| {
+                format!(
+                    "{} [nar_hash={}, nar_size={}]",
+                    output.output_store_path, output.nar_hash, output.nar_size
+                )
+            })
+            .collect::<Vec<_>>();
+        info!(
+            round_id = reveal.round_id,
+            builder_id = %reveal.evidence.builder_id,
+            evidence_id,
+            outputs = ?output_results,
+            cache_locations = reveal.cache_locations.len(),
+            "evidence revealed"
+        );
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let evidence_json = serde_json::to_string(&reveal.evidence)
+                .unwrap_or_else(|error| format!("<failed to serialize evidence: {error}>"));
+            debug!(
+                round_id = reveal.round_id,
+                builder_id = %reveal.evidence.builder_id,
+                nonce = %reveal.nonce,
+                evidence = %evidence_json,
+                cache_locations = ?reveal.cache_locations,
+                "commit-reveal payload disclosed"
+            );
+        }
+
         let model = round::Entity::find_by_id(reveal.round_id)
             .one(&self.database)
             .await
@@ -651,10 +714,17 @@ impl EvidenceStore {
             let mut update: round::ActiveModel = model.clone().into();
             update.reveal_started_at = Set(Some(model.commit_deadline));
             update.reveal_deadline = Set(Some(model.commit_deadline + config.reveal_window));
-            update
+            let model = update
                 .update(&self.database)
                 .await
-                .map_err(ProtocolError::internal)?
+                .map_err(ProtocolError::internal)?;
+            info!(
+                round_id = model.id,
+                commit_count,
+                reveal_deadline = ?model.reveal_deadline,
+                "commit deadline reached; reveal phase started"
+            );
+            model
         } else {
             model
         };
@@ -671,6 +741,17 @@ impl EvidenceStore {
                     .update(&self.database)
                     .await
                     .map_err(ProtocolError::internal)?;
+                if all_revealed {
+                    info!(
+                        round_id = model.id,
+                        commit_count, reveal_count, "commit-reveal round completed"
+                    );
+                } else {
+                    info!(
+                        round_id = model.id,
+                        commit_count, reveal_count, "commit-reveal round expired"
+                    );
+                }
                 return Ok(None);
             }
         }
@@ -840,7 +921,7 @@ impl EvidenceStore {
             .await
             .context("failed to query build output evidence by store hash")?;
         let Some((approved_round_id, variant, evidence_ids)) = self
-            .select_output_consensus(output_rows, round_id, minimum_builders, config)
+            .select_output_consensus(store_hash, output_rows, round_id, minimum_builders, config)
             .await?
         else {
             return Ok(None);
@@ -869,6 +950,7 @@ impl EvidenceStore {
 
     async fn select_output_consensus(
         &self,
+        store_hash: &str,
         output_rows: Vec<build_output_entity::Model>,
         requested_round_id: Option<i64>,
         minimum_builders: usize,
@@ -944,6 +1026,10 @@ impl EvidenceStore {
             }
         }
         let Some((_, latest_round_id)) = latest else {
+            debug!(
+                store_hash,
+                requested_round_id, "no eligible closed round for output"
+            );
             return Ok(None);
         };
 
@@ -962,8 +1048,14 @@ impl EvidenceStore {
         }
 
         let Some(maximum) = variants.values().map(BTreeMap::len).max() else {
+            debug!(
+                store_hash,
+                round_id = latest_round_id,
+                "round has no output variants"
+            );
             return Ok(None);
         };
+        let variant_count = variants.len();
         let mut leaders = variants
             .into_iter()
             .filter(|(_, builders)| builders.len() == maximum);
@@ -971,8 +1063,25 @@ impl EvidenceStore {
             return Ok(None);
         };
         if leaders.next().is_some() || builders.len() < minimum_builders {
+            debug!(
+                store_hash,
+                round_id = latest_round_id,
+                variant_count,
+                leading_builders = maximum,
+                minimum_builders,
+                "output has no unique consensus"
+            );
             return Ok(None);
         }
+
+        info!(
+            store_hash,
+            round_id = latest_round_id,
+            store_path = %fingerprint.store_path,
+            agreeing_builders = builders.len(),
+            variant_count,
+            "output consensus approved"
+        );
 
         Ok(Some((
             latest_round_id,
@@ -1412,7 +1521,7 @@ mod tests {
             .unwrap();
         assert!(
             store
-                .select_output_consensus(output_rows, None, 2, config)
+                .select_output_consensus("hello", output_rows, None, 2, config)
                 .await
                 .unwrap()
                 .is_none()
