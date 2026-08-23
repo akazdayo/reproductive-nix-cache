@@ -13,6 +13,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::mpsc;
+use tracing::{error, info};
 
 #[derive(Clone)]
 pub struct RoundManager {
@@ -139,37 +140,39 @@ impl Dispatcher {
 
 async fn run_worker(mut receiver: mpsc::Receiver<QueuedBuild>, dispatcher: Dispatcher) {
     while let Some(job) = receiver.recv().await {
-        eprintln!(
-            "round manager build job {} started: package_ref={}",
-            job.job_id, job.command.package_ref
+        info!(
+            job_id = job.job_id,
+            package_ref = %job.command.package_ref,
+            builders = dispatcher.nodes.len(),
+            "build dispatch started"
         );
         let response = dispatcher.dispatch(&job.command).await;
         let mut succeeded = 0;
         for outcome in response.builders {
             if outcome.success {
                 succeeded += 1;
-                eprintln!(
-                    "round manager build job {} succeeded: node={} builder_id={} round_id={} evidence_id={}",
-                    job.job_id,
-                    outcome.node,
-                    outcome.builder_id.as_deref().unwrap_or("<unknown>"),
-                    outcome.round_id.unwrap_or_default(),
-                    outcome.evidence_id.unwrap_or_default()
+                info!(
+                    job_id = job.job_id,
+                    node = %outcome.node,
+                    builder_id = outcome.builder_id.as_deref().unwrap_or("<unknown>"),
+                    round_id = outcome.round_id,
+                    evidence_id = outcome.evidence_id,
+                    "builder completed build"
                 );
             } else {
-                eprintln!(
-                    "round manager build job {} failed: node={} error={}",
-                    job.job_id,
-                    outcome.node,
-                    outcome.error.as_deref().unwrap_or("unknown error")
+                error!(
+                    job_id = job.job_id,
+                    node = %outcome.node,
+                    error = outcome.error.as_deref().unwrap_or("unknown error"),
+                    "builder failed build"
                 );
             }
         }
-        eprintln!(
-            "round manager build job {} finished: succeeded={} failed={}",
-            job.job_id,
+        info!(
+            job_id = job.job_id,
             succeeded,
-            dispatcher.nodes.len() - succeeded
+            failed = dispatcher.nodes.len() - succeeded,
+            "build dispatch finished"
         );
     }
 }

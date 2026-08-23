@@ -17,6 +17,7 @@ use shared::{
     EvidenceReceipt, EvidenceReveal, RoundStatus,
 };
 use std::sync::Arc;
+use tracing::warn;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -398,6 +399,7 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        warn!(status = %self.status, error = %self.message, "request failed");
         (
             self.status,
             Json(ErrorResponse {

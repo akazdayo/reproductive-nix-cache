@@ -10,9 +10,18 @@ use anyhow::bail;
 use chrono::Duration;
 use clap::Parser;
 use tokio::net::TcpListener;
+use tracing::info;
+use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_target(false)
+        .compact()
+        .init();
     let cli = cli::Cli::parse();
 
     let config = config::Config::default();
@@ -34,6 +43,7 @@ async fn main() -> anyhow::Result<()> {
         reveal_window: Duration::seconds(cli.reveal_window_seconds),
     };
     let cache = binary_cache::BinaryCache::new(cli.cache_min_builders)?;
+    let builder_node_count = cli.builder_nodes.len();
     let mut state = api::AppState::new(store)
         .with_round_config(round_config)
         .with_binary_cache(cache);
@@ -59,9 +69,15 @@ async fn main() -> anyhow::Result<()> {
     }
     let app = api::router(state);
     let listener = TcpListener::bind(listen).await?;
-    eprintln!(
-        "reproductive-nix-cache server listening on {listen}; database: {}",
-        database.display()
+    info!(
+        %listen,
+        database = %database.display(),
+        commit_min_builders = cli.commit_min_builders,
+        cache_min_builders = cli.cache_min_builders,
+        commit_window_seconds = cli.commit_window_seconds,
+        reveal_window_seconds = cli.reveal_window_seconds,
+        builder_nodes = builder_node_count,
+        "server started"
     );
     axum::serve(listener, app).await?;
 

@@ -32,6 +32,7 @@ cd /home/akazdayo/programs/sechack/reproductive-nix-cache
 
 NIX_CACHE_MANAGER_TOKEN=manager-secret \
 NIX_CACHE_BUILDER_TOKEN=builder-secret \
+RUST_LOG=reproductive_nix_cache_server=debug \
 nix develop -c cargo run -p server -- \
   --listen 127.0.0.1:51337 \
   --database /tmp/reproductive-nix-cache-demo.sqlite \
@@ -45,6 +46,11 @@ nix develop -c cargo run -p server -- \
 
 `--commit-window-seconds` と `--reveal-window-seconds` は、デモ中のビルド時間に余裕を
 持たせるため 120 秒にしています。
+
+ターミナル A には、ラウンドID、commit/reveal件数、フェーズ遷移、Builderごとの出力結果が
+表示されます。さらにcommitment digestと、reveal成功後のnonce、Evidence全文も確認できます。
+Binary Cacheへのアクセス時は合意結果と未合意の理由も表示されます。Evidenceにはビルドの
+stdout/stderrも含まれるため、このdebug設定はデモ用途に限定してください。
 
 ## 3. Builder Node を 2 台起動
 

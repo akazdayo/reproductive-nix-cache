@@ -11,6 +11,13 @@ cargo run -p server -- \
   --cache-min-builders 2
 ```
 
+server は起動設定、commit-reveal のラウンド作成とフェーズ遷移、commit/reveal 件数、
+Builder の成否、出力の合意結果を標準エラーへ記録します。既定は `info` で、未合意の
+判定も確認する場合は `RUST_LOG=reproductive_nix_cache_server=debug` を指定します。
+commitment digest は `info`、reveal成功後のnonce、Evidence全文、cache URIは `debug` で
+記録されます。Evidenceにはビルドのstdout/stderrも含まれるため、共有環境ではログの
+保存先と公開範囲に注意してください。
+
 各 builder は事前に `attic push` など、その cache 固有の方法で成果物を投入し、
 Evidence の reveal と同時に `--cache-location` で HTTP(S) cache のベース URI を通知します。
 合意した出力を報告した builder の URI だけが取得候補になり、`.narinfo` が合意結果と
