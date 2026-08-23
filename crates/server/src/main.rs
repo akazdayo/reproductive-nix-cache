@@ -54,18 +54,9 @@ async fn main() -> anyhow::Result<()> {
                 cli.commit_min_builders
             );
         }
-        let manager_token = cli
-            .manager_token
-            .ok_or_else(|| anyhow::anyhow!("NIX_CACHE_MANAGER_TOKEN is required"))?;
-        let builder_token = cli
-            .builder_token
-            .ok_or_else(|| anyhow::anyhow!("NIX_CACHE_BUILDER_TOKEN is required"))?;
-        let manager = round_manager::RoundManager::new(
-            cli.builder_nodes,
-            builder_token,
-            cli.build_queue_capacity,
-        )?;
-        state = state.with_round_manager(manager, manager_token);
+        let manager =
+            round_manager::RoundManager::new(cli.builder_nodes, cli.build_queue_capacity)?;
+        state = state.with_round_manager(manager);
     }
     let app = api::router(state);
     let listener = TcpListener::bind(listen).await?;
