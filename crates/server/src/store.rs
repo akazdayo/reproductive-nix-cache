@@ -132,6 +132,7 @@ pub struct OverviewSnapshot {
     pub rounds: Vec<round::Model>,
     pub commitments: Vec<commitment::Model>,
     pub evidences: Vec<evidence_entity::Model>,
+    pub cache_locations: Vec<cache_location::Model>,
     pub claims: Vec<claim::Model>,
     pub build_outputs: Vec<build_output_entity::Model>,
 }
@@ -999,6 +1000,16 @@ impl EvidenceStore {
                 .all(&transaction)
                 .await?
         };
+        let cache_locations = if evidence_ids.is_empty() {
+            Vec::new()
+        } else {
+            cache_location::Entity::find()
+                .filter(cache_location::Column::EvidenceId.is_in(evidence_ids.clone()))
+                .order_by_asc(cache_location::Column::EvidenceId)
+                .order_by_asc(cache_location::Column::Position)
+                .all(&transaction)
+                .await?
+        };
         let claims = if evidence_ids.is_empty() {
             Vec::new()
         } else {
@@ -1026,6 +1037,7 @@ impl EvidenceStore {
             rounds,
             commitments,
             evidences,
+            cache_locations,
             claims,
             build_outputs,
         })

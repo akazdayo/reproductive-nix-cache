@@ -39,6 +39,7 @@ struct OverviewParticipant {
     evidence_id: Option<i64>,
     package: Option<OverviewPackage>,
     outputs: Vec<OverviewOutput>,
+    cache_locations: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -83,6 +84,13 @@ fn response_from_snapshot(snapshot: OverviewSnapshot) -> OverviewResponse {
     for output in snapshot.build_outputs {
         outputs.entry(output.claim_id).or_default().push(output);
     }
+    let mut cache_locations = BTreeMap::<i64, Vec<String>>::new();
+    for location in snapshot.cache_locations {
+        cache_locations
+            .entry(location.evidence_id)
+            .or_default()
+            .push(location.uri);
+    }
     let mut commitments = BTreeMap::new();
     for commitment in snapshot.commitments {
         commitments
@@ -104,6 +112,7 @@ fn response_from_snapshot(snapshot: OverviewSnapshot) -> OverviewResponse {
                     &evidences,
                     &claims,
                     &outputs,
+                    &cache_locations,
                 )
             })
             .collect(),
@@ -116,6 +125,7 @@ fn round_response(
     evidences: &BTreeMap<i64, evidence::Model>,
     claims: &BTreeMap<i64, claim::Model>,
     outputs: &BTreeMap<i64, Vec<build_output::Model>>,
+    cache_locations: &BTreeMap<i64, Vec<String>>,
 ) -> OverviewRound {
     let phase = round_phase(&round);
     let commit_count = commitments.len();
@@ -153,6 +163,11 @@ fn round_response(
                     name: evidence.package_name.clone(),
                 }),
                 outputs: participant_outputs,
+                cache_locations: commitment
+                    .evidence_id
+                    .and_then(|id| cache_locations.get(&id))
+                    .cloned()
+                    .unwrap_or_default(),
             }
         })
         .collect::<Vec<_>>();

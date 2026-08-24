@@ -665,6 +665,16 @@ mod tests {
         nonce: &str,
         evidence: &Evidence,
     ) -> Response {
+        reveal_via_api_with_locations(app, round_id, nonce, evidence, Vec::new()).await
+    }
+
+    async fn reveal_via_api_with_locations(
+        app: &Router,
+        round_id: i64,
+        nonce: &str,
+        evidence: &Evidence,
+        cache_locations: Vec<CacheLocation>,
+    ) -> Response {
         app.clone()
             .oneshot(
                 Request::builder()
@@ -676,7 +686,7 @@ mod tests {
                             round_id,
                             nonce: nonce.into(),
                             evidence: evidence.clone(),
-                            cache_locations: Vec::new(),
+                            cache_locations,
                         })
                         .unwrap(),
                     ))
@@ -989,6 +999,7 @@ mod tests {
         let participant = &waiting_json["rounds"][0]["participants"][0];
         assert_eq!(participant["reveal_status"], "waiting");
         assert_eq!(participant["outputs"], serde_json::json!([]));
+        assert_eq!(participant["cache_locations"], serde_json::json!([]));
         let waiting_text = String::from_utf8(waiting_body.to_vec()).unwrap();
         assert!(!waiting_text.contains("digest"));
         assert!(!waiting_text.contains("nonce"));
@@ -996,16 +1007,31 @@ mod tests {
         let second = evidence("builder-b", "sha256-result");
         let (second_round_id, second_nonce) = commit_via_api(&app, &second).await;
         assert_eq!(second_round_id, round_id);
+        let cache_location = CacheLocation {
+            uri: "https://cache.example/builds".into(),
+        };
         assert_eq!(
-            reveal_via_api(&app, round_id, &first_nonce, &first)
-                .await
-                .status(),
+            reveal_via_api_with_locations(
+                &app,
+                round_id,
+                &first_nonce,
+                &first,
+                vec![cache_location.clone()],
+            )
+            .await
+            .status(),
             StatusCode::CREATED
         );
         assert_eq!(
-            reveal_via_api(&app, round_id, &second_nonce, &second)
-                .await
-                .status(),
+            reveal_via_api_with_locations(
+                &app,
+                round_id,
+                &second_nonce,
+                &second,
+                vec![cache_location.clone()],
+            )
+            .await
+            .status(),
             StatusCode::CREATED
         );
 
@@ -1029,6 +1055,10 @@ mod tests {
         {
             assert_eq!(participant["reveal_status"], "success");
             assert_eq!(participant["outputs"][0]["nar_hash"], "sha256-result");
+            assert_eq!(
+                participant["cache_locations"],
+                serde_json::json!(["https://cache.example/builds/"])
+            );
         }
     }
 

@@ -21,7 +21,8 @@ commitment digest は `info`、reveal成功後のnonce、Evidence全文、cache 
 起動後に `http://127.0.0.1:51337/` を開くと、直近50ラウンドをObsidianのGraph View風に
 表示します。点の大きさは接続数、Builderの塗りはrevealされた結果ハッシュ、外周は
 reveal状態（灰色: waiting、赤: failed、緑: success）を表します。同じ結果ハッシュは
-同じ色の結果ノードへ接続されます。表示データは `GET /v1/overview`、ヘルスチェックは
+同じ色の結果ノードへ接続され、reveal時に報告されたcacheは青いノードとして対応する
+結果ハッシュへ接続されます。表示データは `GET /v1/overview`、ヘルスチェックは
 `GET /healthz` です。
 
 15 Builderが同一ラウンドへ10件の一致結果と5件の偽結果を送るGraph Viewデモは、

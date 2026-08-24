@@ -125,6 +125,7 @@
     .legend-dot.success { border-color: var(--success); }
     .legend-dot.failed { border-color: var(--failed); }
     .legend-dot.hash { border: 0; background: linear-gradient(135deg, #a987ff, #53d5ad); }
+    .legend-dot.cache { border: 0; background: #66b9ff; box-shadow: 0 0 7px rgba(102, 185, 255, .55); }
     .zoom-hint { position: absolute; right: 18px; bottom: 18px; color: var(--faint); font-size: 9px; pointer-events: none; }
 
     #tooltip { position: fixed; z-index: 10; pointer-events: none; opacity: 0; transform: translate(10px, 10px); padding: 7px 9px; background: #242730; border: 1px solid #454a58; box-shadow: var(--shadow); border-radius: 6px; font-size: 10px; max-width: 280px; transition: opacity .08s ease; }
@@ -155,6 +156,9 @@
     .output-name { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 9px; }
     .output-name span { color: var(--muted); }
     .output code { display: block; margin-top: 4px; color: var(--faint); font-size: 8px; line-height: 1.45; overflow-wrap: anywhere; word-break: break-all; }
+    .caches { margin-top: 9px; padding-top: 8px; border-top: 1px solid var(--line-soft); }
+    .caches > span { display: block; margin-bottom: 5px; color: var(--faint); font-size: 8px; letter-spacing: .08em; text-transform: uppercase; }
+    .caches code { display: block; color: #8acaff; font-size: 8px; line-height: 1.55; overflow-wrap: anywhere; word-break: break-all; }
     .empty { padding: 28px 18px; color: var(--muted); font-size: 11px; line-height: 1.6; text-align: center; }
     .error-banner { display: none; position: absolute; top: 58px; left: 50%; transform: translateX(-50%); z-index: 4; border: 1px solid rgba(255, 101, 122, .35); background: rgba(53, 27, 34, .92); color: #ffb1bd; border-radius: 7px; padding: 8px 12px; font-size: 10px; box-shadow: var(--shadow); }
     .error-banner.visible { display: block; }
@@ -212,6 +216,7 @@
           <span class="legend-item"><i class="legend-dot failed"></i> failed</span>
           <span class="legend-item"><i class="legend-dot success"></i> success</span>
           <span class="legend-item"><i class="legend-dot hash"></i> same hash · same fill</span>
+          <span class="legend-item"><i class="legend-dot cache"></i> cache</span>
         </div>
         <div class="zoom-hint">scroll to zoom · drag to move</div>
         <div class="error-banner" id="error-banner">Overview data could not be refreshed.</div>
@@ -229,6 +234,7 @@
       "use strict";
 
       const STATUS_COLORS = { waiting: "#8d93a1", failed: "#ff657a", success: "#57d68d" };
+      const CACHE_COLOR = "#66b9ff";
       const state = {
         data: { rounds: [] }, selectedRoundId: null, selectedNodeId: null,
         nodes: [], edges: [], transform: { x: 0, y: 0, scale: 1 },
@@ -241,6 +247,7 @@
       const escapeHtml = value => String(value ?? "").replace(/[&<>'"]/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[char]);
       const phaseLabel = phase => ({ committing: "Committing", revealing: "Revealing", completed: "Completed", expired: "Expired" })[phase] || phase;
       const fileName = path => path ? path.split("/").pop().replace(/\.drv$/, "") : "unknown derivation";
+      const cacheLabel = uri => { try { return new URL(uri).host; } catch { return uri; } };
       const shortHash = hash => hash && hash.length > 19 ? `${hash.slice(0, 11)}…${hash.slice(-6)}` : (hash || "waiting");
       const formatTime = value => value ? new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(new Date(value)) : "—";
       const formatBytes = bytes => {
@@ -291,8 +298,9 @@
         for (const participant of round.participants) {
           const key = resultKey(participant);
           if (!key) continue;
-          if (!groups.has(key)) groups.set(key, { key, color: hashColor(key), participants: [], outputs: participant.outputs });
+          if (!groups.has(key)) groups.set(key, { key, color: hashColor(key), participants: [], outputs: participant.outputs, cacheLocations: new Set() });
           groups.get(key).participants.push(participant);
+          for (const uri of participant.cache_locations || []) groups.get(key).cacheLocations.add(uri);
         }
         return [...groups.values()].sort((left, right) => right.participants.length - left.participants.length || left.key.localeCompare(right.key));
       }
@@ -319,6 +327,7 @@
             <div class="result-head"><code>${escapeHtml(shortHash(group.outputs[0]?.nar_hash))}</code><span class="votes">${group.participants.length} builder${group.participants.length === 1 ? "" : "s"}</span></div>
             <p class="builders">${group.participants.map(participant => escapeHtml(participant.builder_id)).join(" · ")}</p>
             ${group.outputs.map(output => `<div class="output"><div class="output-name"><strong>${escapeHtml(output.name)}</strong><span>${formatBytes(output.nar_size)}</span></div><code>${escapeHtml(output.store_path)}<br>${escapeHtml(output.nar_hash)}</code></div>`).join("")}
+            ${group.cacheLocations.size ? `<div class="caches"><span>Caches</span>${[...group.cacheLocations].sort().map(uri => `<code>${escapeHtml(uri)}</code>`).join("")}</div>` : ""}
           </article>`).join("") : '<div class="empty">Result hashes appear after a successful reveal.</div>';
         panel.innerHTML = `
           <section class="detail-section">
@@ -367,7 +376,21 @@
         groups.forEach((group, index) => {
           const angle = Math.PI * 2 * index / Math.max(groups.length, 1) - Math.PI / 2;
           const radius = groups.length === 1 ? 225 : 250;
-          state.nodes.push({ id: `result:${group.key}`, type: "result", label: shortHash(group.outputs[0]?.nar_hash), detail: `${group.participants.length} matching builder${group.participants.length === 1 ? "" : "s"}`, key: group.key, color: group.color, x: Math.cos(angle) * radius, y: Math.sin(angle) * radius, vx: 0, vy: 0, degree: group.participants.length });
+          state.nodes.push({ id: `result:${group.key}`, type: "result", label: shortHash(group.outputs[0]?.nar_hash), detail: `${group.participants.length} matching builder${group.participants.length === 1 ? "" : "s"}`, key: group.key, color: group.color, x: Math.cos(angle) * radius, y: Math.sin(angle) * radius, vx: 0, vy: 0, degree: group.participants.length + group.cacheLocations.size });
+        });
+
+        const caches = new Map();
+        for (const group of groups) {
+          for (const uri of group.cacheLocations) {
+            if (!caches.has(uri)) caches.set(uri, new Set());
+            caches.get(uri).add(group.key);
+          }
+        }
+        [...caches.entries()].forEach(([uri, resultKeys], index) => {
+          const angle = Math.PI * 2 * index / Math.max(caches.size, 1) + Math.PI / 2;
+          const node = { id: `cache:${uri}`, type: "cache", label: cacheLabel(uri), detail: uri, color: CACHE_COLOR, x: Math.cos(angle) * 340, y: Math.sin(angle) * 340, vx: 0, vy: 0, degree: resultKeys.size };
+          state.nodes.push(node);
+          for (const key of resultKeys) state.edges.push({ source: `result:${key}`, target: node.id, color: CACHE_COLOR, type: "cache" });
         });
 
         round.participants.forEach((participant, index) => {
@@ -383,7 +406,7 @@
       }
 
       function nodeRadius(node) {
-        const base = node.type === "round" ? 10 : node.type === "result" ? 8 : 6;
+        const base = node.type === "round" ? 10 : node.type === "result" ? 8 : node.type === "cache" ? 7 : 6;
         return base + Math.sqrt(Math.max(node.degree, 1)) * (node.type === "builder" ? 1.7 : 2.5);
       }
 
@@ -407,7 +430,7 @@
           const source = byId.get(edge.source), target = byId.get(edge.target);
           const dx = target.x - source.x, dy = target.y - source.y;
           const distance = Math.max(Math.sqrt(dx * dx + dy * dy), 1);
-          const ideal = edge.type === "result" ? 92 : 145;
+          const ideal = edge.type === "result" ? 92 : edge.type === "cache" ? 135 : 145;
           const force = (distance - ideal) * .0045;
           const fx = dx / distance * force, fy = dy / distance * force;
           if (!source.fixed) { source.vx += fx; source.vy += fy; }
@@ -465,7 +488,7 @@
           const source = graphToScreen(byId.get(edge.source)), target = graphToScreen(byId.get(edge.target));
           ctx.beginPath(); ctx.moveTo(source.x, source.y); ctx.lineTo(target.x, target.y);
           ctx.strokeStyle = edge.type === "result" ? edge.color.replace("hsl", "hsla").replace(")", " / .34)") : `${edge.color}45`;
-          ctx.lineWidth = (edge.type === "result" ? 1.2 : .8) * Math.max(.7, state.transform.scale);
+          ctx.lineWidth = (edge.type === "result" ? 1.2 : edge.type === "cache" ? 1.1 : .8) * Math.max(.7, state.transform.scale);
           ctx.stroke();
         }
         for (const node of state.nodes) drawNode(node);
@@ -479,7 +502,7 @@
           ctx.shadowColor = "rgba(169, 135, 255, .55)"; ctx.shadowBlur = 18;
           ctx.fillStyle = "#a987ff";
         } else {
-          ctx.shadowColor = node.color || "transparent"; ctx.shadowBlur = node.type === "result" ? 14 : 7;
+          ctx.shadowColor = node.color || "transparent"; ctx.shadowBlur = node.type === "result" ? 14 : node.type === "cache" ? 11 : 7;
           ctx.fillStyle = node.color;
         }
         ctx.beginPath(); ctx.arc(point.x, point.y, radius, 0, Math.PI * 2); ctx.fill();
@@ -487,7 +510,7 @@
         if (node.type === "builder") {
           ctx.strokeStyle = STATUS_COLORS[node.status]; ctx.lineWidth = Math.max(2, 2.4 * state.transform.scale);
           ctx.beginPath(); ctx.arc(point.x, point.y, radius + 3 * state.transform.scale, 0, Math.PI * 2); ctx.stroke();
-        } else if (node.type === "result") {
+        } else if (node.type === "result" || node.type === "cache") {
           ctx.strokeStyle = "rgba(255,255,255,.4)"; ctx.lineWidth = .8;
           ctx.beginPath(); ctx.arc(point.x, point.y, radius + 1, 0, Math.PI * 2); ctx.stroke();
         }

@@ -42,6 +42,14 @@ def parse_args():
         "--fake-hash",
         default="sha256-fake-result-5-builders",
     )
+    parser.add_argument(
+        "--correct-cache",
+        default="https://cache-correct.demo.invalid/builds",
+    )
+    parser.add_argument(
+        "--fake-cache",
+        default="https://cache-fake.demo.invalid/builds",
+    )
     args = parser.parse_args()
     if args.correct_builders < 1 or args.fake_builders < 1:
         parser.error("builder counts must both be at least 1")
@@ -166,6 +174,7 @@ def run(args):
 
     print("REVEAL PHASE")
     for builder_id, nonce, evidence, kind in submissions:
+        cache_uri = args.correct_cache if kind == "correct" else args.fake_cache
         status, receipt = request(
             args.server,
             "POST",
@@ -174,7 +183,7 @@ def run(args):
                 "round_id": round_id,
                 "nonce": nonce,
                 "evidence": evidence,
-                "cache_locations": [],
+                "cache_locations": [{"uri": cache_uri}],
             },
         )
         print(
