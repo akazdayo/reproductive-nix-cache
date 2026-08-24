@@ -116,6 +116,36 @@ serverの標準エラー出力へ表示されます。キューは永続化さ�
 `--commit-window-seconds` を超えないよう、実際のビルド時間に合わせてwindowを
 設定してください。
 
+### Substituteを有効にした7 Builder E2E
+
+Round Managerと7個の実Builder Nodeをtmux内で起動し、`substitute: true`のcurl要求から
+実際のNix build、commit/reveal、7件の結果一致までを自動検証できます。control
+ウィンドウにはManager・curl・最終判定、buildersウィンドウには7 Nodeを表示します。
+
+```console
+$ nix develop -c ./examples/demo_substitute_tmux.sh
+```
+
+自動実行ではdetachモードを使います。既定ではManagerを`0.0.0.0:52337`、Builderを
+localhostの52338〜52344で起動します。
+
+```console
+$ nix develop -c ./examples/demo_substitute_tmux.sh --detach
+$ tmux attach-session -t rnc-substitute-demo
+```
+
+投入されるリクエストは次の内容です。
+
+```console
+$ curl -X POST http://127.0.0.1:52337/v1/builds \
+    -H 'Content-Type: application/json' \
+    -d '{"package_ref":"nixpkgs#hello","substitute":true,"claims":[]}'
+```
+
+これは高速UIデモと異なり、本当にNix buildと`--rebuild`を実行します。初回buildでは
+substituteが許可されますが、対象が既にローカルNix storeに存在する場合はdownloadが
+発生しないことがあります。
+
 ## Prometheus metrics
 
 `GET /metrics` は認証なしで Prometheus text format を返します。

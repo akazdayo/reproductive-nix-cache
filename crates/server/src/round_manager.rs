@@ -271,6 +271,7 @@ async fn run_worker(
         info!(
             job_id = job.job_id,
             package_ref = %job.command.package_ref,
+            substitute = job.command.substitute,
             builders = dispatcher.nodes.len(),
             "build dispatch started"
         );
@@ -419,7 +420,7 @@ mod tests {
         let dispatcher = Dispatcher::new(vec![first, second]).unwrap();
         let command = BuildCommand {
             package_ref: "nixpkgs#hello".into(),
-            substitute: false,
+            substitute: true,
             claims: vec![],
         };
 

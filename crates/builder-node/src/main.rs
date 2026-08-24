@@ -107,15 +107,24 @@ async fn main() -> anyhow::Result<()> {
     let execute: BuildExecutor = Arc::new(move |command| {
         let config = Arc::clone(&config);
         Box::pin(async move {
+            eprintln!(
+                "builder node build started: package_ref={}, substitute={}",
+                command.package_ref, command.substitute
+            );
             let result = execute_build(&command, &config).await.map_err(|error| {
                 eprintln!("builder node build failed: {error:#}");
                 "build failed; see builder node logs".to_owned()
             })?;
-            Ok(BuildNodeReceipt {
+            let receipt = BuildNodeReceipt {
                 builder_id: result.evidence.builder_id.clone(),
                 round_id: result.round.id,
                 evidence_id: result.receipt.evidence.id,
-            })
+            };
+            eprintln!(
+                "builder node build completed: builder_id={}, round_id={}, evidence_id={}",
+                receipt.builder_id, receipt.round_id, receipt.evidence_id
+            );
+            Ok(receipt)
         })
     });
     let app = router(execute);
@@ -188,7 +197,10 @@ mod tests {
             })
         });
         let app = router(execute);
-        let command = command();
+        let command = BuildCommand {
+            substitute: true,
+            ..command()
+        };
         let response = app.oneshot(request(&command)).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let receipt: BuildNodeReceipt =
