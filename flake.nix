@@ -84,9 +84,12 @@
                 cargo-deny
                 cargo-edit
                 cargo-watch
+                curl
                 rust-analyzer
                 nix-output-monitor
+                python3
                 self.formatter.${system}
+                tmux
               ])
               ++ self.checks.${system}.pre-commit-check.enabledPackages;
 

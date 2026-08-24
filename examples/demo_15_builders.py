@@ -201,10 +201,43 @@ def run(args):
         for participant in overview_round["participants"]
     )
 
+    expected_groups = collections.Counter(
+        {
+            args.correct_hash: args.correct_builders,
+            args.fake_hash: args.fake_builders,
+        }
+    )
+    if round_status["phase"] != "completed":
+        raise RuntimeError(f"round did not complete: {round_status['phase']}")
+    if round_status["commit_count"] != total or round_status["reveal_count"] != total:
+        raise RuntimeError(
+            "unexpected round counts: "
+            f"commits={round_status['commit_count']}, "
+            f"reveals={round_status['reveal_count']}, expected={total}"
+        )
+    if groups != expected_groups:
+        raise RuntimeError(f"unexpected result groups: {dict(groups)}")
+
+    expected_caches = {
+        args.correct_hash: args.correct_cache.rstrip("/") + "/",
+        args.fake_hash: args.fake_cache.rstrip("/") + "/",
+    }
+    for participant in overview_round["participants"]:
+        nar_hash = participant["outputs"][0]["nar_hash"]
+        if participant["cache_locations"] != [expected_caches[nar_hash]]:
+            raise RuntimeError(
+                f"unexpected cache locations for {participant['builder_id']}: "
+                f"{participant['cache_locations']}"
+            )
+
     print("FINAL")
     print(json.dumps(round_status, indent=2))
     for nar_hash, count in groups.most_common():
         print(f"  {count} builders -> {nar_hash}")
+    print(
+        f"E2E PASS: round #{round_id}, {total} reveals, "
+        f"{args.correct_builders} correct, {args.fake_builders} fake"
+    )
 
 
 if __name__ == "__main__":

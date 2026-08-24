@@ -38,6 +38,23 @@ $ cargo run -p server -- \
 $ python3 examples/demo_15_builders.py
 ```
 
+serverの起動、デモ投入、結果検証をtmuxの4ペインでまとめて確認する場合は、次の
+1コマンドを実行します。serverログ、15 Builderのcommit/reveal、Overview APIの要約、
+E2EのPASS/FAILを同時に表示します。終了後は `Ctrl-b d` でdetachし、表示された
+`tmux kill-session` コマンドでserverごと停止できます。
+
+```console
+$ nix develop -c ./examples/demo_ui_tmux.sh
+```
+
+CIや自動確認ではdetachモードを使います。E2E結果がPASSなら終了コード0、FAILなら
+非0を返し、tmux sessionはログ確認用に残ります。
+
+```console
+$ nix develop -c ./examples/demo_ui_tmux.sh --detach --port 5124
+$ tmux attach-session -t rnc-ui-demo
+```
+
 各 builder は事前に `attic push` など、その cache 固有の方法で成果物を投入し、
 Evidence の reveal と同時に `--cache-location` で HTTP(S) cache のベース URI を通知します。
 合意した出力を報告した builder の URI だけが取得候補になり、`.narinfo` が合意結果と
