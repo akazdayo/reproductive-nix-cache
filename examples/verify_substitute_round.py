@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Wait for and verify the seven-Builder substitute-enabled E2E round."""
+"""Verify seven honest Builders against three forged Evidence reports."""
 
 import argparse
 import json
@@ -14,7 +14,8 @@ def parse_args():
     parser.add_argument("--server", required=True)
     parser.add_argument("--manager-log", type=pathlib.Path, required=True)
     parser.add_argument("--package", required=True)
-    parser.add_argument("--builders", type=int, required=True)
+    parser.add_argument("--honest-builders", type=int, required=True)
+    parser.add_argument("--liars", type=int, required=True)
     parser.add_argument("--timeout-seconds", type=int, default=900)
     return parser.parse_args()
 
@@ -50,11 +51,16 @@ def verify_round(args, overview):
         raise RuntimeError(status)
     if phase != "completed":
         return status
-    if commits != args.builders or reveals != args.builders:
+    total = args.honest_builders + args.liars
+    if commits != total or reveals != total:
         raise RuntimeError(f"unexpected completed round counts: {status}")
 
     participants = round_["participants"]
-    expected_ids = {f"substitute-{index:02d}" for index in range(1, args.builders + 1)}
+    honest_ids = {
+        f"substitute-{index:02d}" for index in range(1, args.honest_builders + 1)
+    }
+    liar_ids = {f"liar-{index:02d}" for index in range(1, args.liars + 1)}
+    expected_ids = honest_ids | liar_ids
     actual_ids = {participant["builder_id"] for participant in participants}
     if actual_ids != expected_ids:
         raise RuntimeError(f"unexpected Builders: {sorted(actual_ids)}")
@@ -62,7 +68,7 @@ def verify_round(args, overview):
         raise RuntimeError("a Builder did not reveal successfully")
 
     repository, package_name = args.package.split("#", 1)
-    fingerprints = set()
+    fingerprints = {}
     for participant in participants:
         if participant["package"] != {
             "repository": repository,
@@ -74,11 +80,35 @@ def verify_round(args, overview):
             )
         if not participant["outputs"]:
             raise RuntimeError(f"no outputs from {participant['builder_id']}")
-        fingerprints.add(
-            json.dumps(participant["outputs"], sort_keys=True, separators=(",", ":"))
+        expected_caches = (
+            ["https://liar-cache.demo.invalid/builds/"]
+            if participant["builder_id"] in liar_ids
+            else []
         )
-    if len(fingerprints) != 1:
+        if participant["cache_locations"] != expected_caches:
+            raise RuntimeError(
+                f"unexpected cache locations from {participant['builder_id']}: "
+                f"{participant['cache_locations']}"
+            )
+        fingerprint = json.dumps(
+            participant["outputs"], sort_keys=True, separators=(",", ":")
+        )
+        fingerprints.setdefault(fingerprint, set()).add(participant["builder_id"])
+    if len(fingerprints) != 2:
         raise RuntimeError(f"Builders produced {len(fingerprints)} output variants")
+    groups = sorted((len(builders), builders) for builders in fingerprints.values())
+    if [count for count, _ in groups] != sorted([args.liars, args.honest_builders]):
+        raise RuntimeError(
+            f"unexpected output group sizes: {[count for count, _ in groups]}"
+        )
+    honest_groups = [builders for builders in fingerprints.values() if honest_ids <= builders]
+    liar_groups = [builders for builders in fingerprints.values() if liar_ids <= builders]
+    if len(honest_groups) != 1 or len(liar_groups) != 1:
+        raise RuntimeError("honest or liar identities were split across output variants")
+    honest_group = honest_groups[0]
+    liar_group = liar_groups[0]
+    if honest_group != honest_ids or liar_group != liar_ids:
+        raise RuntimeError("honest and liar identities were mixed across output variants")
 
     log = args.manager_log.read_text(errors="replace")
     dispatch_lines = [
@@ -86,12 +116,18 @@ def verify_round(args, overview):
     ]
     if not any("substitute=true" in line for line in dispatch_lines):
         return f"{status}; waiting for substitute=true Manager log"
-    if not completed_dispatch(log, args.builders):
+    if not completed_dispatch(log, total):
         return f"{status}; waiting for Round Manager completion"
 
-    output = participants[0]["outputs"][0]
+    honest_participant = next(
+        participant
+        for participant in participants
+        if participant["builder_id"] in honest_ids
+    )
+    output = honest_participant["outputs"][0]
     print(
-        f"E2E PASS: {args.builders} Builders agreed with substitute=true\n"
+        f"E2E PASS: {args.honest_builders} honest Builders beat "
+        f"{args.liars} liars with substitute=true\n"
         f"round: #{round_['id']}\n"
         f"store path: {output['store_path']}\n"
         f"NAR hash: {output['nar_hash']}"

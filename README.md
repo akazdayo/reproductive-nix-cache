@@ -116,18 +116,22 @@ serverの標準エラー出力へ表示されます。キューは永続化さ�
 `--commit-window-seconds` を超えないよう、実際のビルド時間に合わせてwindowを
 設定してください。
 
-### Substituteを有効にした7 Builder E2E
+### Substituteを有効にした7 Honest + 3 Liar E2E
 
-Round Managerと7個の実Builder Nodeをtmux内で起動し、`substitute: true`のcurl要求から
-実際のNix build、commit/reveal、7件の結果一致までを自動検証できます。control
-ウィンドウにはManager・curl・最終判定、buildersウィンドウには7 Nodeを表示します。
+Round Managerと7個の正しい実Builder Nodeに加え、偽のNAR hashを報告する3個のliar
+プロセスをtmux内で起動します。`substitute: true`のcurl要求から実際のNix build、
+commit/reveal、正7対偽3の結果分岐までを自動検証できます。commit閾値は10、cache
+合意閾値は7です。controlウィンドウにはManager・curl・最終判定、buildersには
+7 Node、liarsには3個の偽Evidence送信プロセスを表示します。
 
 ```console
 $ nix develop -c ./examples/demo_substitute_tmux.sh
 ```
 
-自動実行ではdetachモードを使います。既定ではManagerを`0.0.0.0:52337`、Builderを
-localhostの52338〜52344で起動します。
+自動実行ではdetachモードを使います。既定ではManagerを`0.0.0.0:52337`、正しい
+Builderをlocalhostの52338〜52344、liar Builder Nodeを52345〜52347で起動します。
+liarはRound Managerから同じbuild命令を受けますが、Nix buildを行わず、同じderivationに
+偽hashと`liar-cache.demo.invalid`をcommit/revealします。
 
 ```console
 $ nix develop -c ./examples/demo_substitute_tmux.sh --detach
@@ -142,9 +146,10 @@ $ curl -X POST http://127.0.0.1:52337/v1/builds \
     -d '{"package_ref":"nixpkgs#hello","substitute":true,"claims":[]}'
 ```
 
-これは高速UIデモと異なり、本当にNix buildと`--rebuild`を実行します。初回buildでは
-substituteが許可されますが、対象が既にローカルNix storeに存在する場合はdownloadが
-発生しないことがあります。
+これは高速UIデモと異なり、正しい7 Nodeでは本当にNix buildと`--rebuild`を実行します。
+初回buildではsubstituteが許可されますが、対象が既にローカルNix storeに存在する場合は
+downloadが発生しないことがあります。Graph Viewには正しいhashへ7 Node、偽hashへ
+3 liar、さらに偽hashから偽cacheへの接続が表示されます。
 
 ## Prometheus metrics
 

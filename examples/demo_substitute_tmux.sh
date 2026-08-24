@@ -3,7 +3,9 @@ set -euo pipefail
 
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 REPOSITORY_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILDER_COUNT=7
+HONEST_BUILDER_COUNT=7
+LIAR_COUNT=3
+TOTAL_PARTICIPANT_COUNT=$((HONEST_BUILDER_COUNT + LIAR_COUNT))
 
 write_result() {
     local message=$1
@@ -15,20 +17,34 @@ run_manager() {
     local args=(
         --listen "0.0.0.0:${DEMO_MANAGER_PORT}"
         --database "$DEMO_DIR/demo.sqlite"
-        --commit-min-builders "$DEMO_BUILDER_COUNT"
-        --cache-min-builders "$DEMO_BUILDER_COUNT"
+        --commit-min-builders "$DEMO_TOTAL_PARTICIPANT_COUNT"
+        --cache-min-builders "$DEMO_HONEST_BUILDER_COUNT"
         --commit-window-seconds 600
         --reveal-window-seconds 600
     )
     local index
-    for index in $(seq 1 "$DEMO_BUILDER_COUNT"); do
+    for index in $(seq 1 "$DEMO_TOTAL_PARTICIPANT_COUNT"); do
         args+=(--builder-node "http://127.0.0.1:$((DEMO_MANAGER_PORT + index))")
     done
 
     cd "$DEMO_ROOT"
-    RUST_LOG=reproductive_nix_cache_server=debug \
-        "$DEMO_ROOT/target/debug/reproductive-nix-cache-server" "${args[@]}" \
-        2>&1 | tee "$DEMO_DIR/manager.log"
+    exec > >(tee "$DEMO_DIR/manager.log") 2>&1
+    exec env RUST_LOG=reproductive_nix_cache_server=debug \
+        "$DEMO_ROOT/target/debug/reproductive-nix-cache-server" "${args[@]}"
+}
+
+run_liar() {
+    local index=$1
+    local port=$2
+    local builder_id
+    printf -v builder_id 'liar-%02d' "$index"
+
+    exec > >(tee "$DEMO_DIR/${builder_id}.log") 2>&1
+    exec python3 "$DEMO_ROOT/examples/demo_liar_builder.py" \
+        --listen "127.0.0.1:${port}" \
+        --server "$DEMO_MANAGER_URL" \
+        --builder-id "$builder_id" \
+        --derivation-path "$DEMO_DERIVATION_PATH"
 }
 
 run_builder() {
@@ -38,25 +54,31 @@ run_builder() {
     printf -v builder_id 'substitute-%02d' "$index"
 
     cd "$DEMO_ROOT"
-    "$DEMO_ROOT/target/debug/reproductive-nix-cache-builder-node" \
+    exec > >(tee "$DEMO_DIR/${builder_id}.log") 2>&1
+    exec "$DEMO_ROOT/target/debug/reproductive-nix-cache-builder-node" \
         --listen "127.0.0.1:${port}" \
         --builder-id "$builder_id" \
-        --server "$DEMO_MANAGER_HOST" \
-        2>&1 | tee "$DEMO_DIR/${builder_id}.log"
+        --server "$DEMO_MANAGER_HOST"
 }
 
 all_services_are_healthy() {
     curl -fsS "$DEMO_MANAGER_URL/healthz" >/dev/null 2>&1 || return 1
     local index
-    for index in $(seq 1 "$DEMO_BUILDER_COUNT"); do
+    for index in $(seq 1 "$DEMO_HONEST_BUILDER_COUNT"); do
         curl -fsS "http://127.0.0.1:$((DEMO_MANAGER_PORT + index))/" \
+            >/dev/null 2>&1 || return 1
+    done
+    for index in $(seq 1 "$DEMO_LIAR_COUNT"); do
+        curl -fsS \
+            "http://127.0.0.1:$((DEMO_MANAGER_PORT + DEMO_HONEST_BUILDER_COUNT + index))/" \
             >/dev/null 2>&1 || return 1
     done
 }
 
 run_request() {
-    printf 'Waiting for Round Manager and %s Builder Nodes' "$DEMO_BUILDER_COUNT"
-    for _ in $(seq 1 300); do
+    printf 'Waiting for Round Manager, %s honest Builders, and %s liars' \
+        "$DEMO_HONEST_BUILDER_COUNT" "$DEMO_LIAR_COUNT"
+    for _ in $(seq 1 600); do
         if all_services_are_healthy; then
             printf ' ready\n\n'
             break
@@ -115,9 +137,10 @@ PY
         --server "$DEMO_MANAGER_URL" \
         --manager-log "$DEMO_DIR/manager.log" \
         --package "$DEMO_PACKAGE" \
-        --builders "$DEMO_BUILDER_COUNT" \
+        --honest-builders "$DEMO_HONEST_BUILDER_COUNT" \
+        --liars "$DEMO_LIAR_COUNT" \
         2>&1 | tee "$DEMO_DIR/verification.log"; then
-        write_result "PASS: ${DEMO_BUILDER_COUNT} real Builders agreed with substitute=true"
+        write_result "PASS: ${DEMO_HONEST_BUILDER_COUNT} honest Builders beat ${DEMO_LIAR_COUNT} liars"
         exit 0
     else
         status=${PIPESTATUS[0]}
@@ -130,13 +153,15 @@ run_summary() {
     printf 'SUBSTITUTE-ENABLED E2E DEMO\n\n'
     printf 'Graph UI:    %s/\n' "$DEMO_MANAGER_URL"
     printf 'Package:     %s\n' "$DEMO_PACKAGE"
-    printf 'Builders:    %s real processes\n' "$DEMO_BUILDER_COUNT"
+    printf 'Honest:      %s real Builder Nodes\n' "$DEMO_HONEST_BUILDER_COUNT"
+    printf 'Liars:       %s malicious Builder Nodes\n' "$DEMO_LIAR_COUNT"
     printf 'Substitute:  true\n'
     printf 'Session:     %s\n' "$DEMO_SESSION"
     printf 'Logs:        %s\n\n' "$DEMO_DIR"
     printf 'Window 0: control\n'
-    printf 'Window 1: seven Builder Nodes\n'
-    printf 'Switch: Ctrl-b 0 / Ctrl-b 1\n'
+    printf 'Window 1: seven honest Builder Nodes\n'
+    printf 'Window 2: three liars\n'
+    printf 'Switch: Ctrl-b 0 / Ctrl-b 1 / Ctrl-b 2\n'
     printf 'Detach: Ctrl-b d\n'
     printf 'Stop:   tmux kill-session -t %s\n\n' "$DEMO_SESSION"
     printf 'Waiting for the E2E result...\n'
@@ -154,6 +179,10 @@ case "${1:-}" in
         ;;
     __builder)
         run_builder "${2:?missing Builder index}" "${3:?missing Builder port}"
+        exit
+        ;;
+    __liar)
+        run_liar "${2:?missing liar index}" "${3:?missing liar port}"
         exit
         ;;
     __request)
@@ -175,7 +204,7 @@ usage() {
     cat <<'EOF'
 Usage: examples/demo_substitute_tmux.sh [OPTIONS]
 
-Run a real seven-Builder E2E through Round Manager with substitute=true.
+Run seven real Builders plus three liars with substitute=true.
 
 Options:
   --detach            Run detached, wait for PASS/FAIL, and return its status
@@ -217,7 +246,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ ! "$MANAGER_PORT" =~ ^[0-9]+$ ]] \
-    || ((MANAGER_PORT < 1 || MANAGER_PORT + BUILDER_COUNT > 65535)); then
+    || ((MANAGER_PORT < 1 || MANAGER_PORT + TOTAL_PARTICIPANT_COUNT > 65535)); then
     printf 'invalid Manager port: %s\n' "$MANAGER_PORT" >&2
     exit 2
 fi
@@ -230,7 +259,7 @@ if [[ ! "$SESSION" =~ ^[A-Za-z0-9_.-]+$ ]]; then
     exit 2
 fi
 
-for command in cargo curl python3 tmux; do
+for command in cargo curl nix python3 tmux; do
     if ! command -v "$command" >/dev/null; then
         printf 'missing command: %s\n' "$command" >&2
         printf 'Run this demo with: nix develop -c ./examples/demo_substitute_tmux.sh\n' >&2
@@ -244,7 +273,7 @@ if tmux has-session -t "$SESSION" 2>/dev/null; then
     exit 1
 fi
 
-if ! python3 - "$MANAGER_PORT" "$BUILDER_COUNT" <<'PY'
+if ! python3 - "$MANAGER_PORT" "$TOTAL_PARTICIPANT_COUNT" <<'PY'
 import socket
 import sys
 
@@ -262,12 +291,18 @@ finally:
 PY
 then
     printf 'one of ports %s-%s is already in use\n' \
-        "$MANAGER_PORT" "$((MANAGER_PORT + BUILDER_COUNT))" >&2
+        "$MANAGER_PORT" "$((MANAGER_PORT + TOTAL_PARTICIPANT_COUNT))" >&2
     exit 1
 fi
 
 printf 'Building Round Manager and Builder Node binaries...\n'
 (cd "$REPOSITORY_ROOT" && cargo build -p server -p builder-node)
+
+printf 'Resolving the derivation path for liar commitments...\n'
+DERIVATION_PATH="$(
+    nix path-info --derivation --json-format 1 --json "$PACKAGE" \
+        | python3 -c 'import json, sys; data = json.load(sys.stdin); assert len(data) == 1; print(next(iter(data)))'
+)"
 
 DEMO_DIR="$(mktemp -d "/tmp/reproductive-substitute-demo.XXXXXX")"
 DEMO_MANAGER_URL="http://127.0.0.1:${MANAGER_PORT}"
@@ -283,8 +318,11 @@ tmux set-environment -t "$SESSION" DEMO_DIR "$DEMO_DIR"
 tmux set-environment -t "$SESSION" DEMO_MANAGER_URL "$DEMO_MANAGER_URL"
 tmux set-environment -t "$SESSION" DEMO_MANAGER_HOST "$DEMO_MANAGER_HOST"
 tmux set-environment -t "$SESSION" DEMO_MANAGER_PORT "$MANAGER_PORT"
-tmux set-environment -t "$SESSION" DEMO_BUILDER_COUNT "$BUILDER_COUNT"
+tmux set-environment -t "$SESSION" DEMO_HONEST_BUILDER_COUNT "$HONEST_BUILDER_COUNT"
+tmux set-environment -t "$SESSION" DEMO_LIAR_COUNT "$LIAR_COUNT"
+tmux set-environment -t "$SESSION" DEMO_TOTAL_PARTICIPANT_COUNT "$TOTAL_PARTICIPANT_COUNT"
 tmux set-environment -t "$SESSION" DEMO_PACKAGE "$PACKAGE"
+tmux set-environment -t "$SESSION" DEMO_DERIVATION_PATH "$DERIVATION_PATH"
 tmux set-environment -t "$SESSION" DEMO_RESULT "$DEMO_RESULT"
 tmux set-environment -t "$SESSION" DEMO_SESSION "$SESSION"
 tmux set-option -t "$SESSION" remain-on-exit on
@@ -306,7 +344,7 @@ tmux select-pane -t "$summary_pane" -T 'demo result'
 
 tmux new-window -d -t "$SESSION" -n builders 'sleep 86400'
 first_builder_pane="$(tmux display-message -p -t "$SESSION:builders.0" '#{pane_id}')"
-for index in $(seq 1 "$BUILDER_COUNT"); do
+for index in $(seq 1 "$HONEST_BUILDER_COUNT"); do
     port=$((MANAGER_PORT + index))
     printf -v builder_command '%q __builder %q %q' "$SCRIPT_PATH" "$index" "$port"
     if [[ "$index" == 1 ]]; then
@@ -320,6 +358,22 @@ for index in $(seq 1 "$BUILDER_COUNT"); do
     tmux select-layout -t "$SESSION:builders" tiled >/dev/null
 done
 
+tmux new-window -d -t "$SESSION" -n liars 'sleep 86400'
+first_liar_pane="$(tmux display-message -p -t "$SESSION:liars.0" '#{pane_id}')"
+for index in $(seq 1 "$LIAR_COUNT"); do
+    port=$((MANAGER_PORT + HONEST_BUILDER_COUNT + index))
+    printf -v liar_command '%q __liar %q %q' "$SCRIPT_PATH" "$index" "$port"
+    if [[ "$index" == 1 ]]; then
+        pane=$first_liar_pane
+        tmux respawn-pane -k -t "$pane" "$liar_command"
+    else
+        pane="$(tmux split-window -P -F '#{pane_id}' -t "$SESSION:liars" "$liar_command")"
+    fi
+    printf -v liar_title 'Liar %02d · %d' "$index" "$port"
+    tmux select-pane -t "$pane" -T "$liar_title"
+    tmux select-layout -t "$SESSION:liars" tiled >/dev/null
+done
+
 tmux select-window -t "$SESSION:control"
 tmux select-pane -t "$request_pane"
 created_session=false
@@ -327,8 +381,12 @@ trap - ERR
 
 printf 'tmux session: %s\n' "$SESSION"
 printf 'Graph UI:    %s/\n' "$DEMO_MANAGER_URL"
-printf 'Builders:    %s real processes on ports %s-%s\n' \
-    "$BUILDER_COUNT" "$((MANAGER_PORT + 1))" "$((MANAGER_PORT + BUILDER_COUNT))"
+printf 'Honest:      %s real Builders on ports %s-%s\n' \
+    "$HONEST_BUILDER_COUNT" "$((MANAGER_PORT + 1))" \
+    "$((MANAGER_PORT + HONEST_BUILDER_COUNT))"
+printf 'Liars:       %s malicious Builder Nodes on ports %s-%s\n' \
+    "$LIAR_COUNT" "$((MANAGER_PORT + HONEST_BUILDER_COUNT + 1))" \
+    "$((MANAGER_PORT + TOTAL_PARTICIPANT_COUNT))"
 printf 'Logs:        %s\n' "$DEMO_DIR"
 
 if [[ "$DETACH" == false ]]; then
